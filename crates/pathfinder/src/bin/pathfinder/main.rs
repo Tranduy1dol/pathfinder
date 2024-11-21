@@ -80,16 +80,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     let sync_state = Arc::new(SyncState::default());
 
-    let ethereum = EthereumContext::setup(config.ethereum.url.clone(), &config.ethereum.password)
-        .await
-        .context("Creating Ethereum context")?;
+    // let ethereum = EthereumContext::setup(config.ethereum.url.clone(), &config.ethereum.password)
+    //     .await
+    //     .context("Creating Ethereum context")?;
 
     // Use the default starknet network if none was configured.
     let network = match config.network {
         Some(ref network) => network.clone(),
-        None => ethereum
-            .default_network()
-            .context("Using default Starknet network based on Ethereum configuration")?,
+        None => panic!("No network!, please setup network.")
+            // ethereum
+            // .default_network()
+            // .context("Using default Starknet network based on Ethereum configuration")?,
     };
 
     // Spawn monitoring if configured.
@@ -119,7 +120,7 @@ async fn async_main() -> anyhow::Result<()> {
     .await
     .context("Configuring pathfinder")?;
 
-    verify_networks(pathfinder_context.network, ethereum.chain)?;
+    // verify_networks(pathfinder_context.network, ethereum.chain)?;
 
     let gateway_public_key = pathfinder_context
         .gateway
@@ -259,24 +260,24 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     )
     .await?;
 
-    let sync_handle = if config.is_sync_enabled {
-        start_sync(
-            sync_storage,
-            pathfinder_context,
-            ethereum.client,
-            sync_state.clone(),
-            &config,
-            tx_pending,
-            rpc_server.get_topic_broadcasters().cloned(),
-            notifications,
-            gossiper,
-            gateway_public_key,
-            p2p_client,
-            config.verify_tree_hashes,
-        )
-    } else {
-        tokio::task::spawn(futures::future::pending())
-    };
+    // let sync_handle = if config.is_sync_enabled {
+    //     start_sync(
+    //         sync_storage,
+    //         pathfinder_context,
+    //         ethereum.client,
+    //         sync_state.clone(),
+    //         &config,
+    //         tx_pending,
+    //         rpc_server.get_topic_broadcasters().cloned(),
+    //         notifications,
+    //         gossiper,
+    //         gateway_public_key,
+    //         p2p_client,
+    //         config.verify_tree_hashes,
+    //     )
+    // } else {
+    //     tokio::task::spawn(futures::future::pending())
+    // };
 
     let rpc_handle = if config.is_rpc_enabled {
         let (rpc_handle, local_addr) = rpc_server
@@ -302,13 +303,13 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
 
     // Monitor our critical spawned process tasks.
     tokio::select! {
-        result = sync_handle => {
-            match result {
-                Ok(task_result) => tracing::error!("Sync process ended unexpected with: {:?}", task_result),
-                Err(err) => tracing::error!("Sync process ended unexpected; failed to join task handle: {:?}", err),
-            }
-            anyhow::bail!("Unexpected shutdown");
-        }
+        // result = sync_handle => {
+        //     match result {
+        //         Ok(task_result) => tracing::error!("Sync process ended unexpected with: {:?}", task_result),
+        //         Err(err) => tracing::error!("Sync process ended unexpected; failed to join task handle: {:?}", err),
+        //     }
+        //     anyhow::bail!("Unexpected shutdown");
+        // }
         result = rpc_handle => {
             match result {
                 Ok(_) => tracing::error!("RPC server process ended unexpectedly"),

@@ -53,7 +53,7 @@ Examples:
         value_hint = clap::ValueHint::Url,
         env = "PATHFINDER_ETHEREUM_API_URL", 
     )]
-    ethereum_url: Url,
+    ethereum_url: Option<Url>,
 
     #[arg(
         long = "http-rpc",
@@ -700,7 +700,7 @@ pub struct Config {
 }
 
 pub struct Ethereum {
-    pub url: Url,
+    pub url: Option<Url>,
     pub password: Option<String>,
 }
 
