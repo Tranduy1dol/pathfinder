@@ -31,6 +31,7 @@ RUN TARGETARCH=${TARGETARCH} ./cargo-chef-cook.sh --profile release-lto --recipe
 
 # Compile the actual libraries and binary now
 COPY . .
+COPY .git .git
 ARG PATHFINDER_FORCE_VERSION
 COPY ./build/cargo-build.sh ./cargo-build.sh
 RUN TARGETARCH=${TARGETARCH} \
