@@ -260,24 +260,24 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     )
     .await?;
 
-    // let sync_handle = if config.is_sync_enabled {
-    //     start_sync(
-    //         sync_storage,
-    //         pathfinder_context,
-    //         ethereum.client,
-    //         sync_state.clone(),
-    //         &config,
-    //         tx_pending,
-    //         rpc_server.get_topic_broadcasters().cloned(),
-    //         notifications,
-    //         gossiper,
-    //         gateway_public_key,
-    //         p2p_client,
-    //         config.verify_tree_hashes,
-    //     )
-    // } else {
-    //     tokio::task::spawn(futures::future::pending())
-    // };
+    let sync_handle = if config.is_sync_enabled {
+        start_sync(
+            sync_storage,
+            pathfinder_context,
+            // ethereum.client,
+            sync_state.clone(),
+            &config,
+            tx_pending,
+            rpc_server.get_topic_broadcasters().cloned(),
+            notifications,
+            gossiper,
+            gateway_public_key,
+            p2p_client,
+            config.verify_tree_hashes,
+        )
+    } else {
+        tokio::task::spawn(futures::future::pending())
+    };
 
     let rpc_handle = if config.is_rpc_enabled {
         let (rpc_handle, local_addr) = rpc_server
@@ -303,13 +303,13 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
 
     // Monitor our critical spawned process tasks.
     tokio::select! {
-        // result = sync_handle => {
-        //     match result {
-        //         Ok(task_result) => tracing::error!("Sync process ended unexpected with: {:?}", task_result),
-        //         Err(err) => tracing::error!("Sync process ended unexpected; failed to join task handle: {:?}", err),
-        //     }
-        //     anyhow::bail!("Unexpected shutdown");
-        // }
+        result = sync_handle => {
+            match result {
+                Ok(task_result) => tracing::error!("Sync process ended unexpected with: {:?}", task_result),
+                Err(err) => tracing::error!("Sync process ended unexpected; failed to join task handle: {:?}", err),
+            }
+            anyhow::bail!("Unexpected shutdown");
+        }
         result = rpc_handle => {
             match result {
                 Ok(_) => tracing::error!("RPC server process ended unexpectedly"),
@@ -499,7 +499,7 @@ async fn start_p2p(
 fn start_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -514,7 +514,7 @@ fn start_sync(
         start_feeder_gateway_sync(
             storage,
             pathfinder_context,
-            ethereum_client,
+            // ethereum_client,
             sync_state,
             config,
             tx_pending,
@@ -528,7 +528,7 @@ fn start_sync(
         start_p2p_sync(
             storage,
             pathfinder_context,
-            ethereum_client,
+            // ethereum_client,
             p2p_client,
             gateway_public_key,
             config.p2p.l1_checkpoint_override,
@@ -542,7 +542,7 @@ fn start_sync(
 fn start_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -556,7 +556,7 @@ fn start_sync(
     start_feeder_gateway_sync(
         storage,
         pathfinder_context,
-        ethereum_client,
+        // ethereum_client,
         sync_state,
         config,
         tx_pending,
@@ -571,7 +571,7 @@ fn start_sync(
 fn start_feeder_gateway_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -582,7 +582,7 @@ fn start_feeder_gateway_sync(
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let sync_context = SyncContext {
         storage,
-        ethereum: ethereum_client,
+        // ethereum: ethereum_client,
         chain: pathfinder_context.network,
         chain_id: pathfinder_context.network_id,
         core_address: pathfinder_context.l1_core_address,
@@ -602,14 +602,14 @@ fn start_feeder_gateway_sync(
         fetch_concurrency: config.feeder_gateway_fetch_concurrency,
     };
 
-    tokio::spawn(state::sync(sync_context, state::l1::sync, state::l2::sync))
+    tokio::spawn(state::sync(sync_context, state::l2::sync))
 }
 
 #[cfg(feature = "p2p")]
 fn start_p2p_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     p2p_client: p2p::client::peer_agnostic::Client,
     gateway_public_key: pathfinder_common::PublicKey,
     l1_checkpoint_override: Option<pathfinder_ethereum::EthereumStateUpdate>,
@@ -618,7 +618,7 @@ fn start_p2p_sync(
     let sync = pathfinder_lib::sync::Sync {
         storage,
         p2p: p2p_client,
-        eth_client: ethereum_client,
+        // eth_client: ethereum_client,
         eth_address: pathfinder_context.l1_core_address,
         fgw_client: pathfinder_context.gateway,
         chain_id: pathfinder_context.network_id,

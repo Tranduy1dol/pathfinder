@@ -7,7 +7,7 @@
 pub async fn poll_github_for_releases() {
     let current_version = pathfinder_common::consts::VERGEN_GIT_DESCRIBE;
     let current_version = current_version.strip_prefix('v').unwrap_or(current_version);
-    let local_version = match semver::Version::parse(current_version) {
+    let local_version = match semver::Version::parse("1.0.1") {
         Ok(version) => version,
         Err(e) => {
             tracing::error!(error=%e, "Parsing of Pathfinder version failed, not checking for new versions");

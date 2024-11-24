@@ -31,6 +31,13 @@ tagged = { path = "../tagged" }
 tagged-debug-derive = { path = "../tagged-debug-derive" }
 thiserror = { workspace = true }
 
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+    "env-filter",
+    "time",
+    "ansi",
+] }
+
 [dev-dependencies]
 rstest = { workspace = true }
 

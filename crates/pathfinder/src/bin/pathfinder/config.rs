@@ -385,7 +385,7 @@ struct P2PCli {
     #[arg(
         long = "p2p.proxy",
         long_help = "Enable syncing from feeder gateway and proxy to p2p network. Otherwise sync from p2p network, which is the default.",
-        default_value = "false",
+        default_value = "true",
         action = clap::ArgAction::Set,
         env = "PATHFINDER_P2P_PROXY"
     )]
