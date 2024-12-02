@@ -10,6 +10,7 @@
 # executable to.
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:0.1.67-rust-1.80-slim-bookworm AS cargo-chef
 WORKDIR /usr/src/pathfinder
+RUN apt-get update && apt install git -y
 
 FROM --platform=$BUILDPLATFORM cargo-chef AS rust-planner
 COPY . .
@@ -36,7 +37,7 @@ COPY ./build/cargo-build.sh ./cargo-build.sh
 RUN TARGETARCH=${TARGETARCH} \
     PATHFINDER_FORCE_VERSION=${PATHFINDER_FORCE_VERSION} \
     ./cargo-build.sh --locked --profile release-lto --package pathfinder --bin pathfinder ${CARGO_EXTRA_ARGS} \
-    && cp target/*-unknown-linux-gnu/release-lto/pathfinder pathfinder-${TARGETARCH}
+    && cp target/*-unknown-linux-gnu/debug/pathfinder pathfinder-${TARGETARCH}
 
 #######################
 # Final Stage: Runner #

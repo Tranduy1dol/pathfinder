@@ -75,9 +75,9 @@ pub enum SyncEvent {
     Pending((Arc<PendingBlock>, Arc<StateUpdate>)),
 }
 
-pub struct SyncContext<G, E> {
+pub struct SyncContext<G> {
     pub storage: Storage,
-    pub ethereum: E,
+    // pub ethereum: E,
     pub chain: Chain,
     pub chain_id: ChainId,
     pub core_address: H160,
@@ -98,25 +98,25 @@ pub struct SyncContext<G, E> {
     pub fetch_casm_from_fgw: bool,
 }
 
-impl<G, E> From<&SyncContext<G, E>> for L1SyncContext<E>
-where
-    E: Clone,
-{
-    fn from(value: &SyncContext<G, E>) -> Self {
-        Self {
-            ethereum: value.ethereum.clone(),
-            chain: value.chain,
-            core_address: value.core_address,
-            poll_interval: value.l1_poll_interval,
-        }
-    }
-}
+// impl<G, E> From<&SyncContext<G, E>> for L1SyncContext<E>
+// where
+//     E: Clone,
+// {
+//     fn from(value: &SyncContext<G, E>) -> Self {
+//         Self {
+//             ethereum: value.ethereum.clone(),
+//             chain: value.chain,
+//             core_address: value.core_address,
+//             poll_interval: value.l1_poll_interval,
+//         }
+//     }
+// }
 
-impl<G, E> From<&SyncContext<G, E>> for L2SyncContext<G>
+impl<G> From<&SyncContext<G>> for L2SyncContext<G>
 where
     G: Clone,
 {
-    fn from(value: &SyncContext<G, E>) -> Self {
+    fn from(value: &SyncContext<G>) -> Self {
         Self {
             sequencer: value.sequencer.clone(),
             chain: value.chain,
@@ -163,17 +163,17 @@ impl Gossiper {
 }
 
 /// Implements the main sync loop, where L1 and L2 sync results are combined.
-pub async fn sync<Ethereum, SequencerClient, F1, F2, L1Sync, L2Sync>(
-    context: SyncContext<SequencerClient, Ethereum>,
-    mut l1_sync: L1Sync,
+pub async fn sync<SequencerClient, F2, L2Sync>(
+    context: SyncContext<SequencerClient>,
+    // mut l1_sync: L1Sync,
     l2_sync: L2Sync,
 ) -> anyhow::Result<()>
 where
-    Ethereum: EthereumApi + Clone + Send + 'static,
+    // Ethereum: EthereumApi + Clone + Send + 'static,
     SequencerClient: GatewayApi + Clone + Send + Sync + 'static,
-    F1: Future<Output = anyhow::Result<()>> + Send + 'static,
+    // F1: Future<Output = anyhow::Result<()>> + Send + 'static,
     F2: Future<Output = anyhow::Result<()>> + Send + 'static,
-    L1Sync: FnMut(mpsc::Sender<SyncEvent>, L1SyncContext<Ethereum>) -> F1,
+    // L1Sync: FnMut(mpsc::Sender<SyncEvent>, L1SyncContext<Ethereum>) -> F1,
     L2Sync: FnOnce(
             mpsc::Sender<SyncEvent>,
             L2SyncContext<SequencerClient>,
@@ -183,12 +183,12 @@ where
         ) -> F2
         + Copy,
 {
-    let l1_context = L1SyncContext::from(&context);
+    // let l1_context = L1SyncContext::from(&context);
     let l2_context = L2SyncContext::from(&context);
 
     let SyncContext {
         storage,
-        ethereum: _,
+        // ethereum: _,
         chain: _,
         chain_id: _,
         core_address: _,
@@ -257,7 +257,7 @@ where
 
     // Start L1 producer task. Clone the event sender so that the channel remains
     // open even if the producer task fails.
-    let mut l1_handle = tokio::spawn(l1_sync(event_sender.clone(), l1_context.clone()));
+    // let mut l1_handle = tokio::spawn(l1_sync(event_sender.clone(), l1_context.clone()));
 
     // Fetch latest blocks from storage
     let latest_blocks = latest_n_blocks(&mut db_conn, block_cache_size)
@@ -316,34 +316,34 @@ where
                 tracing::error!("Tracking chain tip task ended unexpectedly");
                 tracing::debug!("Shutting down other tasks");
 
-                l1_handle.abort();
+                // l1_handle.abort();
                 l2_handle.abort();
                 consumer_handle.abort();
                 pending_handle.abort();
 
-                _ = l1_handle.await;
-                _ = l2_handle.await;
-                _ = consumer_handle.await;
-                _ = pending_handle.await;
+                // _ = l1_handle.await;
+                let _ = l2_handle.await;
+                let _ = consumer_handle.await;
+                let _ = pending_handle.await;
 
                 anyhow::bail!("Sync process terminated");
             },
-            l1_producer_result = &mut l1_handle => {
-                match l1_producer_result.context("Join L1 sync process handle")? {
-                    Ok(()) => {
-                        tracing::error!("L1 sync process terminated without an error.");
-                    }
-                    Err(e) => {
-                        tracing::warn!("L1 sync process terminated with: {e:?}");
-                    }
-                }
-
-                let fut = l1_sync(event_sender.clone(), l1_context.clone());
-                l1_handle = tokio::spawn(async move {
-                    tokio::time::sleep(RESET_DELAY_ON_FAILURE).await;
-                    fut.await
-                });
-            },
+            // l1_producer_result = &mut l1_handle => {
+            //     match l1_producer_result.context("Join L1 sync process handle")? {
+            //         Ok(()) => {
+            //             tracing::error!("L1 sync process terminated without an error.");
+            //         }
+            //         Err(e) => {
+            //             tracing::warn!("L1 sync process terminated with: {e:?}");
+            //         }
+            //     }
+            //
+            //     let fut = l1_sync(event_sender.clone(), l1_context.clone());
+            //     l1_handle = tokio::spawn(async move {
+            //         tokio::time::sleep(RESET_DELAY_ON_FAILURE).await;
+            //         fut.await
+            //     });
+            // },
             l2_producer_result = &mut l2_handle => {
                 // L2 sync process failed; restart it.
                 match l2_producer_result.context("Join L2 sync process handle")? {
@@ -390,25 +390,25 @@ where
 
                 // Shutdown the other processes.
                 tracing::debug!("Shutting down L1 and L2 sync producer tasks");
-                l1_handle.abort();
+                // l1_handle.abort();
                 l2_handle.abort();
                 pending_handle.abort();
                 latest_handle.abort();
 
-                match l1_handle.await {
-                    Ok(Ok(())) => {
-                        tracing::debug!("L1 sync task exited gracefully");
-                    },
-                    Ok(Err(e)) => {
-                        tracing::error!(reason=?e, "L1 sync task terminated with an error");
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        tracing::debug!("L1 sync task cancelled successfully");
-                    },
-                    Err(panic) => {
-                        tracing::error!(%panic, "L1 sync task panic'd");
-                    }
-                }
+                // match l1_handle.await {
+                //     Ok(Ok(())) => {
+                //         tracing::debug!("L1 sync task exited gracefully");
+                //     },
+                //     Ok(Err(e)) => {
+                //         tracing::error!(reason=?e, "L1 sync task terminated with an error");
+                //     }
+                //     Err(e) if e.is_cancelled() => {
+                //         tracing::debug!("L1 sync task cancelled successfully");
+                //     },
+                //     Err(panic) => {
+                //         tracing::error!(%panic, "L1 sync task panic'd");
+                //     }
+                // }
 
                 match l2_handle.await {
                     Ok(Ok(())) => {
@@ -437,7 +437,7 @@ where
                     }
                 }
 
-                _ = pending_handle.await;
+                let _ = pending_handle.await;
 
                 anyhow::bail!("Sync process terminated");
             }
@@ -558,7 +558,7 @@ async fn consumer(
                     }
                 }
 
-                _ = current.send((block_number, block_hash));
+                let _ = current.send((block_number, block_hash));
 
                 let now_timestamp = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
                 let latency = now_timestamp.saturating_sub(block_timestamp.get());
@@ -803,7 +803,7 @@ async fn update_sync_status_latest(
 }
 
 async fn propagate_head(gossiper: &Gossiper, last_propagated: &mut Instant, head: NumberedBlock) {
-    _ = gossiper.propagate_head(head.number, head.hash).await;
+    let _ = gossiper.propagate_head(head.number, head.hash).await;
     *last_propagated = Instant::now();
 }
 

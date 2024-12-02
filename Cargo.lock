@@ -7330,6 +7330,8 @@ dependencies = [
  "tagged",
  "tagged-debug-derive",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
  "vergen",
 ]
 

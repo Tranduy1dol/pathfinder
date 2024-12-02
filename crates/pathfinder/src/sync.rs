@@ -45,7 +45,7 @@ const CHECKPOINT_MARGIN: u64 = 10;
 pub struct Sync {
     pub storage: pathfinder_storage::Storage,
     pub p2p: P2PClient,
-    pub eth_client: pathfinder_ethereum::EthereumClient,
+    // pub eth_client: pathfinder_ethereum::EthereumClient,
     pub eth_address: H160,
     pub fgw_client: GatewayClient,
     pub chain: Chain,
@@ -77,19 +77,14 @@ impl Sync {
     /// retry until we get one.
     async fn get_checkpoint(&self) -> pathfinder_ethereum::EthereumStateUpdate {
         use pathfinder_ethereum::EthereumApi;
-        if let Some(forced) = &self.l1_checkpoint_override {
-            return *forced;
-        }
-
-        loop {
-            match self.eth_client.get_starknet_state(&self.eth_address).await {
-                Ok(latest) => return latest,
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to get L1 checkpoint, retrying");
-                    tokio::time::sleep(RESET_DELAY_ON_FAILURE);
-                }
-            }
-        }
+        match &self.l1_checkpoint_override {
+            Some(checkpoint) => Ok(*checkpoint),
+            None => panic!("No ether provider!")
+                // self
+                // .eth_client
+                // .get_starknet_state(&self.eth_address)
+                // .await
+                // .context("Fetching latest L1 checkpoint"),
     }
 
     /// Run checkpoint sync until it completes successfully, and we are within
@@ -111,7 +106,7 @@ impl Sync {
             let result = checkpoint::Sync {
                 storage: self.storage.clone(),
                 p2p: self.p2p.clone(),
-                eth_client: self.eth_client.clone(),
+                // eth_client: self.eth_client.clone(),
                 eth_address: self.eth_address,
                 fgw_client: self.fgw_client.clone(),
                 chain: self.chain,

@@ -53,7 +53,7 @@ Examples:
         value_hint = clap::ValueHint::Url,
         env = "PATHFINDER_ETHEREUM_API_URL", 
     )]
-    ethereum_url: Url,
+    ethereum_url: Option<Url>,
 
     #[arg(
         long = "http-rpc",
@@ -414,7 +414,7 @@ struct P2PCli {
     #[arg(
         long = "p2p.proxy",
         long_help = "Enable syncing from feeder gateway and proxy to p2p network. Otherwise sync from p2p network, which is the default.",
-        default_value = "false",
+        default_value = "true",
         action = clap::ArgAction::Set,
         env = "PATHFINDER_P2P_PROXY"
     )]
@@ -734,7 +734,7 @@ pub struct Config {
 }
 
 pub struct Ethereum {
-    pub url: Url,
+    pub url: Option<Url>,
     pub password: Option<String>,
 }
 

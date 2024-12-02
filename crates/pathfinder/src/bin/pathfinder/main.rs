@@ -84,16 +84,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     let sync_state = Arc::new(SyncState::default());
 
-    let ethereum = EthereumContext::setup(config.ethereum.url.clone(), &config.ethereum.password)
-        .await
-        .context("Creating Ethereum context")?;
+    // let ethereum = EthereumContext::setup(config.ethereum.url.clone(), &config.ethereum.password)
+    //     .await
+    //     .context("Creating Ethereum context")?;
 
     // Use the default starknet network if none was configured.
     let network = match config.network {
         Some(ref network) => network.clone(),
-        None => ethereum
-            .default_network()
-            .context("Using default Starknet network based on Ethereum configuration")?,
+        None => panic!("No network!, please setup network.")
+            // ethereum
+            // .default_network()
+            // .context("Using default Starknet network based on Ethereum configuration")?,
     };
 
     // Spawn monitoring if configured.
@@ -123,7 +124,7 @@ async fn async_main() -> anyhow::Result<()> {
     .await
     .context("Configuring pathfinder")?;
 
-    verify_networks(pathfinder_context.network, ethereum.chain)?;
+    // verify_networks(pathfinder_context.network, ethereum.chain)?;
 
     let gateway_public_key = pathfinder_context
         .gateway
@@ -271,7 +272,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         start_sync(
             sync_storage,
             pathfinder_context,
-            ethereum.client,
+            // ethereum.client,
             sync_state.clone(),
             &config,
             tx_pending,
@@ -513,7 +514,7 @@ async fn start_p2p(
 fn start_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -528,7 +529,7 @@ fn start_sync(
         start_feeder_gateway_sync(
             storage,
             pathfinder_context,
-            ethereum_client,
+            // ethereum_client,
             sync_state,
             config,
             tx_pending,
@@ -542,7 +543,7 @@ fn start_sync(
         start_p2p_sync(
             storage,
             pathfinder_context,
-            ethereum_client,
+            // ethereum_client,
             p2p_client,
             gateway_public_key,
             config.p2p.l1_checkpoint_override,
@@ -556,7 +557,7 @@ fn start_sync(
 fn start_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -570,7 +571,7 @@ fn start_sync(
     start_feeder_gateway_sync(
         storage,
         pathfinder_context,
-        ethereum_client,
+        // ethereum_client,
         sync_state,
         config,
         tx_pending,
@@ -585,7 +586,7 @@ fn start_sync(
 fn start_feeder_gateway_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     sync_state: Arc<SyncState>,
     config: &config::Config,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
@@ -596,7 +597,7 @@ fn start_feeder_gateway_sync(
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let sync_context = SyncContext {
         storage,
-        ethereum: ethereum_client,
+        // ethereum: ethereum_client,
         chain: pathfinder_context.network,
         chain_id: pathfinder_context.network_id,
         core_address: pathfinder_context.l1_core_address,
@@ -617,14 +618,14 @@ fn start_feeder_gateway_sync(
         fetch_casm_from_fgw: config.fetch_casm_from_fgw,
     };
 
-    tokio::spawn(state::sync(sync_context, state::l1::sync, state::l2::sync))
+    tokio::spawn(state::sync(sync_context, state::l2::sync))
 }
 
 #[cfg(feature = "p2p")]
 fn start_p2p_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
-    ethereum_client: EthereumClient,
+    // ethereum_client: EthereumClient,
     p2p_client: p2p::client::peer_agnostic::Client,
     gateway_public_key: pathfinder_common::PublicKey,
     l1_checkpoint_override: Option<pathfinder_ethereum::EthereumStateUpdate>,
@@ -633,7 +634,7 @@ fn start_p2p_sync(
     let sync = pathfinder_lib::sync::Sync {
         storage,
         p2p: p2p_client,
-        eth_client: ethereum_client,
+        // eth_client: ethereum_client,
         eth_address: pathfinder_context.l1_core_address,
         fgw_client: pathfinder_context.gateway,
         chain_id: pathfinder_context.network_id,

@@ -56,7 +56,7 @@ pub struct Sync {
     pub storage: Storage,
     pub p2p: P2PClient,
     // TODO: merge these two inside the client.
-    pub eth_client: pathfinder_ethereum::EthereumClient,
+    // pub eth_client: pathfinder_ethereum::EthereumClient,
     pub eth_address: H160,
     pub fgw_client: Client,
     pub chain: Chain,
@@ -82,7 +82,7 @@ impl Sync {
         Self {
             storage,
             p2p,
-            eth_client: ethereum.0,
+            // eth_client: ethereum.0,
             eth_address: ethereum.1,
             fgw_client,
             chain,
