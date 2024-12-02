@@ -18,7 +18,7 @@ pub struct SubscribeEvents;
 pub struct Params {
     from_address: Option<ContractAddress>,
     keys: Option<Vec<Vec<EventKey>>>,
-    block: Option<BlockId>,
+    block_id: Option<BlockId>,
 }
 
 impl crate::dto::DeserializeForVersion for Option<Params> {
@@ -35,7 +35,7 @@ impl crate::dto::DeserializeForVersion for Option<Params> {
                 keys: value.deserialize_optional_array("keys", |value| {
                     value.deserialize_array(|value| Ok(EventKey(value.deserialize()?)))
                 })?,
-                block: value.deserialize_optional_serde("block")?,
+                block_id: value.deserialize_optional_serde("block_id")?,
             }))
         })
     }
@@ -68,6 +68,9 @@ impl RpcSubscriptionFlow for SubscribeEvents {
 
     fn validate_params(params: &Self::Params) -> Result<(), RpcError> {
         if let Some(params) = params {
+            if let Some(BlockId::Pending) = params.block_id {
+                return Err(RpcError::ApplicationError(ApplicationError::CallOnPending));
+            }
             if let Some(keys) = &params.keys {
                 if keys.len() > EVENT_KEY_FILTER_LIMIT {
                     return Err(RpcError::ApplicationError(
@@ -85,7 +88,7 @@ impl RpcSubscriptionFlow for SubscribeEvents {
     fn starting_block(params: &Self::Params) -> BlockId {
         params
             .as_ref()
-            .and_then(|req| req.block)
+            .and_then(|req| req.block_id)
             .unwrap_or(BlockId::Latest)
     }
 
@@ -131,7 +134,7 @@ impl RpcSubscriptionFlow for SubscribeEvents {
         state: RpcContext,
         params: Self::Params,
         tx: mpsc::Sender<SubscriptionMessage<Self::Notification>>,
-    ) {
+    ) -> Result<(), RpcError> {
         let mut blocks = state.notifications.l2_blocks.subscribe();
         let mut reorgs = state.notifications.reorgs.subscribe();
         let params = params.unwrap_or_default();
@@ -217,6 +220,7 @@ impl RpcSubscriptionFlow for SubscribeEvents {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -241,15 +245,17 @@ mod tests {
         TransactionIndex,
     };
     use pathfinder_crypto::Felt;
+    use pathfinder_ethereum::EthereumClient;
     use pathfinder_storage::StorageBuilder;
+    use primitive_types::H160;
     use starknet_gateway_client::Client;
     use starknet_gateway_types::reply::Block;
     use tokio::sync::mpsc;
 
     use crate::context::{RpcConfig, RpcContext};
-    use crate::jsonrpc::{handle_json_rpc_socket, RpcRouter};
+    use crate::jsonrpc::{handle_json_rpc_socket, RpcRouter, CATCH_UP_BATCH_SIZE};
     use crate::pending::PendingWatcher;
-    use crate::v02::types::syncing::Syncing;
+    use crate::types::syncing::Syncing;
     use crate::{v08, Notifications, Reorg, SyncState};
 
     #[tokio::test]
@@ -260,7 +266,7 @@ mod tests {
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
-            {"block": {"block_number": 0}}
+            {"block_id": {"block_number": 0}}
         );
         receiver_tx
             .send(Ok(Message::Text(
@@ -280,7 +286,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -322,8 +328,8 @@ mod tests {
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
             {
-                "block": {"block_number": 0},
-                "from_address": "0x90",
+                "block_id": {"block_number": 0},
+                "from_address": "0x46",
             }
         );
         receiver_tx
@@ -344,11 +350,11 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -368,9 +374,9 @@ mod tests {
             .context
             .notifications
             .l2_blocks
-            .send(sample_block(0x90).into())
+            .send(sample_block(0x46).into())
             .unwrap();
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -388,8 +394,8 @@ mod tests {
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
             {
-                "block": {"block_number": 0},
-                "keys": [["0x90"], [], ["0x92", "0x93"]],
+                "block_id": {"block_number": 0},
+                "keys": [["0x46"], [], ["0x47", "0x48"]],
             }
         );
         receiver_tx
@@ -410,11 +416,11 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -434,9 +440,9 @@ mod tests {
             .context
             .notifications
             .l2_blocks
-            .send(sample_block(0x90).into())
+            .send(sample_block(0x46).into())
             .unwrap();
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -454,9 +460,9 @@ mod tests {
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
             {
-                "block": {"block_number": 0},
-                "from_address": "0x90",
-                "keys": [["0x90"], [], ["0x92", "0x93"]],
+                "block_id": {"block_number": 0},
+                "from_address": "0x46",
+                "keys": [["0x46"], [], ["0x47", "0x48"]],
             }
         );
         receiver_tx
@@ -477,11 +483,11 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -501,9 +507,9 @@ mod tests {
             .context
             .notifications
             .l2_blocks
-            .send(sample_block(0x90).into())
+            .send(sample_block(0x46).into())
             .unwrap();
-        let expected = sample_event_message(0x90, subscription_id);
+        let expected = sample_event_message(0x46, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -521,26 +527,26 @@ mod tests {
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
             {
-                "block": {"block_number": 0},
-                "from_address": "0x90",
+                "block_id": {"block_number": 0},
+                "from_address": "0x46",
                 "keys": [
-                    ["0x91"],
-                    ["0x92"],
-                    ["0x93"],
-                    ["0x94"],
-                    ["0x95"],
-                    ["0x96"],
-                    ["0x97"],
-                    ["0x98"],
-                    ["0x99"],
-                    ["0x9a"],
-                    ["0x9b"],
-                    ["0x9c"],
-                    ["0x9d"],
-                    ["0x9e"],
-                    ["0x9f"],
-                    ["0xa0"],
-                    ["0xa1"],
+                    ["0x46"],
+                    ["0x47"],
+                    ["0x48"],
+                    ["0x49"],
+                    ["0x4a"],
+                    ["0x4b"],
+                    ["0x4c"],
+                    ["0x4d"],
+                    ["0x4e"],
+                    ["0x4f"],
+                    ["0x50"],
+                    ["0x51"],
+                    ["0x52"],
+                    ["0x53"],
+                    ["0x54"],
+                    ["0x55"],
+                    ["0x56"],
                 ],
             }
         );
@@ -600,7 +606,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -640,7 +646,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn subscribe_with_pending_block() {
+        let router = setup(0).await;
+        let (sender_tx, mut sender_rx) = mpsc::channel(1024);
+        let (receiver_tx, receiver_rx) = mpsc::channel(1024);
+        handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
+
+        // Send subscription request with pending block
+        receiver_tx
+            .send(Ok(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "starknet_subscribeEvents",
+                    "params": {"block_id": "pending"}
+                })
+                .to_string(),
+            )))
+            .await
+            .unwrap();
+
+        // Expect error response
+        let res = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match res {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": 69,
+                    "message": "This method does not support being called on the pending block"
+                }
+            })
+        );
+    }
+
     async fn setup(num_blocks: u64) -> RpcRouter {
+        assert!(num_blocks == 0 || num_blocks > CATCH_UP_BATCH_SIZE);
+
         let storage = StorageBuilder::in_memory().unwrap();
         tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -677,13 +726,18 @@ mod tests {
             }
             .into(),
             chain_id: ChainId::MAINNET,
+            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
             sequencer: Client::mainnet(Duration::from_secs(10)),
             websocket: None,
             notifications,
+            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
+                .unwrap(),
             config: RpcConfig {
                 batch_concurrency_limit: 64.try_into().unwrap(),
                 get_events_max_blocks_to_scan: 1024.try_into().unwrap(),
                 get_events_max_uncached_bloom_filters_to_load: 1024.try_into().unwrap(),
+                #[cfg(feature = "aggregate_bloom")]
+                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
                 custom_versioned_constants: None,
             },
         };

@@ -83,6 +83,7 @@ impl From<TransactionExecutionError> for TraceBlockTransactionsError {
             ExecutionError {
                 transaction_index,
                 error,
+                error_stack: _,
             } => Self::Custom(anyhow::anyhow!(
                 "Transaction execution failed at index {}: {}",
                 transaction_index,
@@ -335,6 +336,7 @@ pub(crate) mod tests {
         block_hash,
         felt,
         BlockHeader,
+        BlockNumber,
         Chain,
         GasPrice,
         SequencerAddress,
@@ -569,6 +571,10 @@ pub(crate) mod tests {
                     price_in_wei: GasPrice(2),
                     price_in_fri: GasPrice(2),
                 },
+                l2_gas_price: GasPrices {
+                    price_in_wei: GasPrice(3),
+                    price_in_fri: GasPrice(3),
+                },
                 parent_hash: last_block_header.hash,
                 sequencer_address: last_block_header.sequencer_address,
                 status: starknet_gateway_types::reply::Status::Pending,
@@ -634,6 +640,19 @@ pub(crate) mod tests {
         let context = RpcContext::for_tests_on(Chain::Mainnet);
         let mut connection = context.storage.connection().unwrap();
         let transaction = connection.transaction().unwrap();
+
+        // Need to avoid skipping blocks for `insert_transaction_data`.
+        (0..619596)
+            .collect::<Vec<_>>()
+            .chunks(pathfinder_storage::BLOCK_RANGE_LEN as usize)
+            .map(|range| *range.last().unwrap() as u64)
+            .for_each(|block| {
+                let block = BlockNumber::new_or_panic(block);
+                transaction
+                    .insert_transaction_data(block, &[], None)
+                    .unwrap();
+            });
+
         let block: starknet_gateway_types::reply::Block =
             serde_json::from_str(include_str!("../../../fixtures/mainnet-619596.json")).unwrap();
         let transaction_count = block.transactions.len();
@@ -651,6 +670,8 @@ pub(crate) mod tests {
             strk_l1_gas_price: block.l1_gas_price.price_in_fri,
             eth_l1_data_gas_price: block.l1_data_gas_price.price_in_wei,
             strk_l1_data_gas_price: block.l1_data_gas_price.price_in_fri,
+            eth_l2_gas_price: GasPrice(0), // TODO: Fix when we get l2_gas_price in the gateway
+            strk_l2_gas_price: GasPrice(0), // TODO: Fix when we get l2_gas_price in the gateway
             sequencer_address: block
                 .sequencer_address
                 .unwrap_or(SequencerAddress(Felt::ZERO)),
@@ -692,6 +713,7 @@ pub(crate) mod tests {
             .insert_transaction_data(header.number, &transactions_data, Some(&events_data))
             .unwrap();
         transaction.commit().unwrap();
+        drop(connection);
 
         // The tracing succeeds.
         trace_block_transactions(

@@ -3,7 +3,7 @@ use fake::Dummy;
 use libp2p::PeerId;
 use pathfinder_common::event::Event;
 use pathfinder_common::receipt::{ExecutionResources, ExecutionStatus, L2ToL1Message};
-use pathfinder_common::transaction::TransactionVariant;
+use pathfinder_common::transaction::Transaction;
 use pathfinder_common::{
     BlockCommitmentSignature,
     BlockCommitmentSignatureElem,
@@ -12,11 +12,13 @@ use pathfinder_common::{
     BlockNumber,
     BlockTimestamp,
     ClassCommitment,
+    ClassHash,
     EventCommitment,
     Fee,
     GasPrice,
     ReceiptCommitment,
     SequencerAddress,
+    SierraHash,
     SignedBlockHeader,
     StateCommitment,
     StateDiffCommitment,
@@ -35,10 +37,12 @@ pub enum ClassDefinition {
     Cairo {
         block_number: BlockNumber,
         definition: Vec<u8>,
+        hash: ClassHash,
     },
     Sierra {
         block_number: BlockNumber,
         sierra_definition: Vec<u8>,
+        hash: SierraHash,
     },
 }
 
@@ -75,7 +79,7 @@ impl From<pathfinder_common::receipt::Receipt> for Receipt {
     }
 }
 
-pub type TransactionData = Vec<(TransactionVariant, Receipt)>;
+pub type TransactionData = Vec<(Transaction, Receipt)>;
 
 pub type EventsForBlockByTransaction = (BlockNumber, Vec<(TransactionHash, Vec<Event>)>);
 
@@ -101,6 +105,8 @@ impl TryFromDto<p2p_proto::header::SignedBlockHeader> for SignedBlockHeader {
                 strk_l1_gas_price: GasPrice(dto.gas_price_fri),
                 eth_l1_data_gas_price: GasPrice(dto.data_gas_price_wei),
                 strk_l1_data_gas_price: GasPrice(dto.data_gas_price_fri),
+                eth_l2_gas_price: GasPrice(dto.l2_gas_price_wei.unwrap_or_default()),
+                strk_l2_gas_price: GasPrice(dto.l2_gas_price_fri.unwrap_or_default()),
                 sequencer_address: SequencerAddress(dto.sequencer_address.0),
                 starknet_version: dto.protocol_version.parse()?,
                 event_commitment: EventCommitment(dto.events.root.0),

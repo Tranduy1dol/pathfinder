@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -83,7 +83,7 @@ Examples:
     #[arg(
         long = "rpc.root-version",
         long_help = "Version of the JSON-RPC API to serve on the / (root) path",
-        default_value = "v06",
+        default_value = "v07",
         env = "PATHFINDER_RPC_ROOT_VERSION"
     )]
     rpc_root_version: RpcVersion,
@@ -94,7 +94,7 @@ Examples:
                      number of CPU cores available.",
         env = "PATHFINDER_RPC_EXECUTION_CONCURRENCY"
     )]
-    execution_concurrency: Option<std::num::NonZeroU32>,
+    execution_concurrency: Option<NonZeroU32>,
 
     #[arg(
         long = "monitor-address",
@@ -148,6 +148,15 @@ Examples:
         value_name = "WHEN"
     )]
     color: Color,
+
+    #[arg(
+        long = "log-output-json",
+        long_help = "This flag controls when to use colors in the output logs.",
+        default_value = "false",
+        env = "PATHFINDER_LOG_OUTPUT_JSON",
+        value_name = "BOOL"
+    )]
+    log_output_json: bool,
 
     #[arg(
         long = "disable-version-update-check",
@@ -274,6 +283,17 @@ This should only be enabled for debugging purposes as it adds substantial proces
     )]
     get_events_max_uncached_bloom_filters_to_load: std::num::NonZeroUsize,
 
+    #[cfg(feature = "aggregate_bloom")]
+    #[arg(
+        long = "rpc.get-events-max-bloom-filters-to-load",
+        long_help = format!("The number of Bloom filters to load for events when querying for events. \
+                    Each filter covers a {} block range. \
+                    This limit is used to prevent queries from taking too long.", pathfinder_storage::BLOCK_RANGE_LEN),
+        env = "PATHFINDER_RPC_GET_EVENTS_MAX_BLOOM_FILTERS_TO_LOAD",
+        default_value = "3"
+    )]
+    get_events_max_bloom_filters_to_load: std::num::NonZeroUsize,
+
     #[arg(
         long = "storage.state-tries",
         long_help = "When set to `archive` all historical Merkle trie state is preserved. When set to an integer N, only the last N+1 states of the Merkle tries are kept in the database. \
@@ -291,6 +311,15 @@ This should only be enabled for debugging purposes as it adds substantial proces
         env = "PATHFINDER_RPC_CUSTOM_VERSIONED_CONSTANTS_JSON_PATH"
     )]
     custom_versioned_constants_path: Option<PathBuf>,
+
+    #[arg(
+        long = "sync.fetch-casm-from-fgw",
+        long_help = "Do not compile classes locally, instead fetch them from the feeder gateway",
+        env = "PATHFINDER_SYNC_FETCH_CASM_FROM_FGW",
+        default_value = "false",
+        action=ArgAction::Set
+    )]
+    fetch_casm_from_fgw: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq)]
@@ -400,13 +429,14 @@ struct P2PCli {
     identity_config_file: Option<std::path::PathBuf>,
     #[arg(
         long = "p2p.listen-on",
-        long_help = "The multiaddress on which to listen for incoming p2p connections. If not \
-                     provided, default route on randomly assigned port will be used.",
-        value_name = "MULTIADDRESS",
+        long_help = "The list of multiaddresses on which to listen for incoming p2p connections. \
+                     If not provided, default route on randomly assigned port will be used.",
+        value_name = "MULTIADDRESS_LIST",
+        value_delimiter = ',',
         default_value = "/ip4/0.0.0.0/tcp/0",
         env = "PATHFINDER_P2P_LISTEN_ON"
     )]
-    listen_on: Multiaddr,
+    listen_on: Vec<String>,
     #[arg(
         long = "p2p.bootstrap-addresses",
         long_help = r#"Comma separated list of multiaddresses to use as bootstrap nodes. Each multiaddress must contain a peer ID.
@@ -502,9 +532,9 @@ Example:
     #[arg(
         long = "p2p.experimental.max-concurrent-streams",
         long_help = "Maximum allowed number of concurrent streams per each \
-                     request/response-stream protocol.",
+                     request/response-stream protocol per connection.",
         value_name = "LIMIT",
-        default_value = "100",
+        default_value = "1",
         env = "PATHFINDER_P2P_EXPERIMENTAL_MAX_CONCURRENT_STREAMS"
     )]
     max_concurrent_streams: usize,
@@ -682,6 +712,7 @@ pub struct Config {
     pub poll_interval: std::time::Duration,
     pub l1_poll_interval: std::time::Duration,
     pub color: Color,
+    pub log_output_json: bool,
     pub disable_version_update_check: bool,
     pub p2p: P2PConfig,
     pub debug: DebugConfig,
@@ -694,9 +725,12 @@ pub struct Config {
     pub event_bloom_filter_cache_size: NonZeroUsize,
     pub get_events_max_blocks_to_scan: NonZeroUsize,
     pub get_events_max_uncached_bloom_filters_to_load: NonZeroUsize,
+    #[cfg(feature = "aggregate_bloom")]
+    pub get_events_max_bloom_filters_to_load: NonZeroUsize,
     pub state_tries: Option<StateTries>,
     pub custom_versioned_constants: Option<VersionedConstants>,
     pub feeder_gateway_fetch_concurrency: NonZeroUsize,
+    pub fetch_casm_from_fgw: bool,
 }
 
 pub struct Ethereum {
@@ -721,7 +755,7 @@ pub enum NetworkConfig {
 pub struct P2PConfig {
     pub proxy: bool,
     pub identity_config_file: Option<std::path::PathBuf>,
-    pub listen_on: Multiaddr,
+    pub listen_on: Vec<Multiaddr>,
     pub bootstrap_addresses: Vec<Multiaddr>,
     pub predefined_peers: Vec<Multiaddr>,
     pub max_inbound_direct_connections: usize,
@@ -871,7 +905,7 @@ impl P2PConfig {
             max_outbound_connections: args.max_outbound_connections.try_into().unwrap(),
             proxy: args.proxy,
             identity_config_file: args.identity_config_file,
-            listen_on: args.listen_on,
+            listen_on: parse_multiaddr_vec("p2p.listen-on", args.listen_on),
             bootstrap_addresses: parse_multiaddr_vec(
                 "p2p.bootstrap-addresses",
                 args.bootstrap_addresses,
@@ -971,6 +1005,7 @@ impl Config {
             poll_interval: Duration::from_secs(cli.poll_interval.get()),
             l1_poll_interval: Duration::from_secs(cli.l1_poll_interval.get()),
             color: cli.color,
+            log_output_json: cli.log_output_json,
             disable_version_update_check: cli.disable_version_update_check,
             p2p: P2PConfig::parse_or_exit(cli.p2p),
             debug: DebugConfig::parse(cli.debug),
@@ -983,12 +1018,15 @@ impl Config {
             get_events_max_blocks_to_scan: cli.get_events_max_blocks_to_scan,
             get_events_max_uncached_bloom_filters_to_load: cli
                 .get_events_max_uncached_bloom_filters_to_load,
+            #[cfg(feature = "aggregate_bloom")]
+            get_events_max_bloom_filters_to_load: cli.get_events_max_bloom_filters_to_load,
             gateway_timeout: Duration::from_secs(cli.gateway_timeout.get()),
             feeder_gateway_fetch_concurrency: cli.feeder_gateway_fetch_concurrency,
             state_tries: cli.state_tries,
             custom_versioned_constants: cli
                 .custom_versioned_constants_path
                 .map(parse_versioned_constants_or_exit),
+            fetch_casm_from_fgw: cli.fetch_casm_from_fgw,
         }
     }
 }

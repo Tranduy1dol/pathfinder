@@ -1,11 +1,12 @@
-use pathfinder_common::ContractAddress;
+use pathfinder_common::{ContractAddress, L1TransactionHash};
+use primitive_types::H256;
 use serde::de::Error;
 
 use super::serialize::SerializeForVersion;
 use super::{DeserializeForVersion, Value};
 use crate::dto::serialize::{self, Serializer};
 
-pub struct SyncStatus<'a>(pub &'a crate::v02::types::syncing::Status);
+pub struct SyncStatus<'a>(pub &'a crate::types::syncing::Status);
 
 pub struct Felt<'a>(pub &'a pathfinder_crypto::Felt);
 pub struct BlockHash<'a>(pub &'a pathfinder_common::BlockHash);
@@ -246,6 +247,16 @@ impl SerializeForVersion for U256Hex {
     }
 }
 
+impl DeserializeForVersion for H256 {
+    fn deserialize(value: Value) -> Result<Self, serde_json::Error> {
+        let hex_str: String = value.deserialize_serde()?;
+        let bytes = hex_str::bytes_from_hex_str_stripped::<32>(&hex_str).map_err(|e| {
+            serde_json::Error::custom(format!("failed to parse hex string as u256: {}", e))
+        })?;
+        Ok(H256(bytes))
+    }
+}
+
 impl SerializeForVersion for Address<'_> {
     fn serialize(&self, serializer: Serializer) -> Result<serialize::Ok, serialize::Error> {
         serializer.serialize(&Felt(&self.0 .0))
@@ -298,8 +309,8 @@ mod tests {
 
     #[test]
     fn sync_status() {
-        use crate::v02::types::syncing::NumberedBlock;
-        let status = crate::v02::types::syncing::Status {
+        use crate::types::syncing::NumberedBlock;
+        let status = crate::types::syncing::Status {
             starting: NumberedBlock {
                 number: pathfinder_common::BlockNumber::GENESIS,
                 hash: block_hash!("0x123"),

@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::REORG_SUBSCRIPTION_NAME;
 use crate::context::RpcContext;
+use crate::error::ApplicationError;
 use crate::jsonrpc::{CatchUp, RpcError, RpcSubscriptionFlow, SubscriptionMessage};
 use crate::Reorg;
 
@@ -13,7 +14,7 @@ pub struct SubscribeNewHeads;
 
 #[derive(Debug, Clone)]
 pub struct Params {
-    block: Option<BlockId>,
+    block_id: Option<BlockId>,
 }
 
 impl crate::dto::DeserializeForVersion for Option<Params> {
@@ -24,7 +25,7 @@ impl crate::dto::DeserializeForVersion for Option<Params> {
         }
         value.deserialize_map(|value| {
             Ok(Some(Params {
-                block: value.deserialize_optional_serde("block")?,
+                block_id: value.deserialize_optional_serde("block_id")?,
             }))
         })
     }
@@ -55,10 +56,19 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
     type Params = Option<Params>;
     type Notification = Notification;
 
+    fn validate_params(params: &Self::Params) -> Result<(), RpcError> {
+        if let Some(params) = params {
+            if let Some(BlockId::Pending) = params.block_id {
+                return Err(RpcError::ApplicationError(ApplicationError::CallOnPending));
+            }
+        }
+        Ok(())
+    }
+
     fn starting_block(params: &Self::Params) -> BlockId {
         params
             .as_ref()
-            .and_then(|req| req.block)
+            .and_then(|req| req.block_id)
             .unwrap_or(BlockId::Latest)
     }
 
@@ -98,7 +108,7 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
         state: RpcContext,
         _params: Self::Params,
         tx: mpsc::Sender<SubscriptionMessage<Self::Notification>>,
-    ) {
+    ) -> Result<(), RpcError> {
         let mut headers = state.notifications.block_headers.subscribe();
         let mut reorgs = state.notifications.reorgs.subscribe();
         loop {
@@ -149,6 +159,7 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -159,14 +170,16 @@ mod tests {
     use axum::extract::ws::Message;
     use pathfinder_common::{felt, BlockHash, BlockHeader, BlockNumber, ChainId};
     use pathfinder_crypto::Felt;
+    use pathfinder_ethereum::EthereumClient;
     use pathfinder_storage::StorageBuilder;
+    use primitive_types::H160;
     use starknet_gateway_client::Client;
     use tokio::sync::mpsc;
 
     use crate::context::{RpcConfig, RpcContext};
     use crate::jsonrpc::{handle_json_rpc_socket, RpcResponse, RpcRouter, CATCH_UP_BATCH_SIZE};
     use crate::pending::PendingWatcher;
-    use crate::v02::types::syncing::Syncing;
+    use crate::types::syncing::Syncing;
     use crate::{v08, Notifications, Reorg, SubscriptionId, SyncState};
 
     #[tokio::test]
@@ -244,7 +257,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "starknet_subscribeNewHeads",
-                    "params": {"block": {"block_number": 0}}
+                    "params": {"block_id": {"block_number": 0}}
                 })
                 .to_string(),
             )))
@@ -256,7 +269,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -344,7 +357,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -393,7 +406,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -456,6 +469,47 @@ mod tests {
         assert!(rx.is_empty());
     }
 
+    #[tokio::test]
+    async fn subscribe_with_pending_block() {
+        let router = setup(0).await;
+        let (sender_tx, mut sender_rx) = mpsc::channel(1024);
+        let (receiver_tx, receiver_rx) = mpsc::channel(1024);
+        handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
+
+        // Send subscription request with pending block
+        receiver_tx
+            .send(Ok(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "starknet_subscribeNewHeads",
+                    "params": {"block_id": "pending"}
+                })
+                .to_string(),
+            )))
+            .await
+            .unwrap();
+
+        // Expect error response
+        let res = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match res {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": 69,
+                    "message": "This method does not support being called on the pending block"
+                }
+            })
+        );
+    }
+
     async fn setup(num_blocks: u64) -> RpcRouter {
         let storage = StorageBuilder::in_memory().unwrap();
         tokio::task::spawn_blocking({
@@ -484,13 +538,18 @@ mod tests {
             }
             .into(),
             chain_id: ChainId::MAINNET,
+            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
             sequencer: Client::mainnet(Duration::from_secs(10)),
             websocket: None,
             notifications,
+            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
+                .unwrap(),
             config: RpcConfig {
                 batch_concurrency_limit: 1.try_into().unwrap(),
                 get_events_max_blocks_to_scan: 1.try_into().unwrap(),
                 get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
+                #[cfg(feature = "aggregate_bloom")]
+                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
                 custom_versioned_constants: None,
             },
         };
@@ -511,11 +570,11 @@ mod tests {
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = if num_blocks == 0 {
             serde_json::json!(
-                {"block": "latest"}
+                {"block_id": "latest"}
             )
         } else {
             serde_json::json!(
-                {"block": {"block_number": 0}}
+                {"block_id": {"block_number": 0}}
             )
         };
         receiver_tx
@@ -536,7 +595,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -597,6 +656,7 @@ mod tests {
                     "l1_da_mode": "CALLDATA",
                     "l1_data_gas_price": { "price_in_fri": "0x0", "price_in_wei": "0x0" },
                     "l1_gas_price": { "price_in_fri": "0x0", "price_in_wei": "0x0" },
+                    "l2_gas_price": { "price_in_fri": "0x0", "price_in_wei": "0x0" },
                     "new_root": "0x0",
                     "parent_hash": "0x0",
                     "sequencer_address": "0x0",

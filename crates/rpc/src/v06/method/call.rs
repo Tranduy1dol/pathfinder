@@ -12,7 +12,10 @@ pub enum CallError {
     Custom(anyhow::Error),
     BlockNotFound,
     ContractNotFound,
-    ContractError { revert_error: String },
+    ContractError {
+        revert_error: String,
+        revert_error_stack: pathfinder_executor::ErrorStack,
+    },
 }
 
 impl From<anyhow::Error> for CallError {
@@ -27,8 +30,9 @@ impl From<pathfinder_executor::CallError> for CallError {
         match value {
             ContractNotFound => Self::ContractNotFound,
             InvalidMessageSelector => Self::Custom(anyhow::anyhow!("Invalid message selector")),
-            ContractError(error) => Self::ContractError {
+            ContractError(error, error_stack) => Self::ContractError {
                 revert_error: format!("Execution error: {}", error),
+                revert_error_stack: error_stack,
             },
             Internal(e) => Self::Internal(e),
             Custom(e) => Self::Custom(e),
@@ -51,8 +55,12 @@ impl From<CallError> for ApplicationError {
         match value {
             CallError::BlockNotFound => ApplicationError::BlockNotFound,
             CallError::ContractNotFound => ApplicationError::ContractNotFound,
-            CallError::ContractError { revert_error } => ApplicationError::ContractError {
+            CallError::ContractError {
+                revert_error,
+                revert_error_stack,
+            } => ApplicationError::ContractError {
                 revert_error: Some(revert_error),
+                revert_error_stack,
             },
             CallError::Internal(e) => ApplicationError::Internal(e),
             CallError::Custom(e) => ApplicationError::Custom(e),
@@ -267,6 +275,7 @@ mod tests {
                 .unwrap();
 
             tx.commit().unwrap();
+            drop(db);
 
             let context =
                 RpcContext::for_tests_on(pathfinder_common::Chain::Mainnet).with_storage(storage);
@@ -421,6 +430,10 @@ mod tests {
                         price_in_fri: Default::default(),
                     },
                     l1_data_gas_price: Default::default(),
+                    l2_gas_price: GasPrices {
+                        price_in_wei: last_block_header.eth_l2_gas_price,
+                        price_in_fri: last_block_header.strk_l2_gas_price,
+                    },
                     parent_hash: last_block_header.hash,
                     sequencer_address: last_block_header.sequencer_address,
                     status: starknet_gateway_types::reply::Status::Pending,
@@ -472,6 +485,7 @@ mod tests {
             tx.insert_state_update(block_number, &state_update).unwrap();
 
             tx.commit().unwrap();
+            drop(connection);
 
             let input = CallInput {
                 request: FunctionCall {

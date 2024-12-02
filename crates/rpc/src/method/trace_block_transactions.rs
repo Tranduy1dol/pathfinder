@@ -1,5 +1,6 @@
 use anyhow::Context;
 use pathfinder_common::BlockId;
+use pathfinder_executor::types::InnerCallExecutionResources;
 use pathfinder_executor::TransactionExecutionError;
 use starknet_gateway_client::GatewayApi;
 
@@ -272,10 +273,37 @@ pub(crate) fn map_gateway_trace(
             .try_into()
             .unwrap(),
     };
+    let l1_gas = validate_invocation_resources
+        .total_gas_consumed
+        .unwrap_or_default()
+        .l1_gas
+        + function_invocation_resources
+            .total_gas_consumed
+            .unwrap_or_default()
+            .l1_gas
+        + fee_transfer_invocation_resources
+            .total_gas_consumed
+            .unwrap_or_default()
+            .l1_gas;
+    let l1_data_gas = validate_invocation_resources
+        .total_gas_consumed
+        .unwrap_or_default()
+        .l1_data_gas
+        + function_invocation_resources
+            .total_gas_consumed
+            .unwrap_or_default()
+            .l1_data_gas
+        + fee_transfer_invocation_resources
+            .total_gas_consumed
+            .unwrap_or_default()
+            .l1_data_gas;
     let execution_resources = pathfinder_executor::types::ExecutionResources {
         computation_resources,
         // These values are not available in the gateway trace.
         data_availability: Default::default(),
+        l1_gas,
+        l1_data_gas,
+        l2_gas: 0,
     };
 
     use pathfinder_common::transaction::TransactionVariant;
@@ -426,6 +454,15 @@ fn map_gateway_function_invocation(
             .collect(),
         result: invocation.result,
         computation_resources: map_gateway_computation_resources(invocation.execution_resources),
+        execution_resources: InnerCallExecutionResources {
+            l1_gas: invocation
+                .execution_resources
+                .total_gas_consumed
+                .map(|gas| gas.l1_gas)
+                .unwrap_or_default(),
+            // TODO: Use proper l1_gas value for Starknet 0.13.3
+            l2_gas: 0,
+        },
     })
 }
 
@@ -560,6 +597,7 @@ impl From<TransactionExecutionError> for TraceBlockTransactionsError {
             ExecutionError {
                 transaction_index,
                 error,
+                error_stack: _,
             } => Self::Custom(anyhow::anyhow!(
                 "Transaction execution failed at index {}: {}",
                 transaction_index,
@@ -828,6 +866,10 @@ pub(crate) mod tests {
                 l1_data_gas_price: GasPrices {
                     price_in_wei: GasPrice(2),
                     price_in_fri: GasPrice(2),
+                },
+                l2_gas_price: GasPrices {
+                    price_in_wei: GasPrice(3),
+                    price_in_fri: GasPrice(3),
                 },
                 parent_hash: last_block_header.hash,
                 sequencer_address: last_block_header.sequencer_address,

@@ -2,11 +2,11 @@ use std::collections::HashSet;
 
 use axum::async_trait;
 use pathfinder_common::transaction::Transaction;
-use pathfinder_common::{BlockId, BlockNumber, ContractAddress, TransactionHash};
+use pathfinder_common::{BlockNumber, ContractAddress, TransactionHash};
 use tokio::sync::mpsc;
 
 use crate::context::RpcContext;
-use crate::jsonrpc::{CatchUp, RpcError, RpcSubscriptionFlow, SubscriptionMessage};
+use crate::jsonrpc::{RpcError, RpcSubscriptionFlow, SubscriptionMessage};
 
 pub struct SubscribePendingTransactions;
 
@@ -63,26 +63,11 @@ impl RpcSubscriptionFlow for SubscribePendingTransactions {
     type Params = Option<Params>;
     type Notification = Notification;
 
-    fn starting_block(_params: &Self::Params) -> BlockId {
-        // Catch-up is not supported.
-        BlockId::Latest
-    }
-
-    async fn catch_up(
-        _state: &RpcContext,
-        _params: &Self::Params,
-        _from: BlockNumber,
-        _to: BlockNumber,
-    ) -> Result<CatchUp<Self::Notification>, RpcError> {
-        // Catch-up is not supported.
-        Ok(Default::default())
-    }
-
     async fn subscribe(
         state: RpcContext,
         params: Self::Params,
         tx: mpsc::Sender<SubscriptionMessage<Self::Notification>>,
-    ) {
+    ) -> Result<(), RpcError> {
         let params = params.unwrap_or_default();
         let mut pending_data = state.pending_data.0.clone();
         // Last block sent to the subscriber. Initial value doesn't really matter.
@@ -138,12 +123,12 @@ impl RpcSubscriptionFlow for SubscribePendingTransactions {
                     .is_err()
                 {
                     // Subscription has been closed.
-                    return;
+                    return Ok(());
                 }
             }
             if pending_data.changed().await.is_err() {
                 tracing::debug!("Pending data channel closed, stopping subscription");
-                break;
+                return Ok(());
             }
         }
     }
@@ -163,7 +148,9 @@ mod tests {
         ContractAddress,
         TransactionHash,
     };
+    use pathfinder_ethereum::EthereumClient;
     use pathfinder_storage::StorageBuilder;
+    use primitive_types::H160;
     use starknet_gateway_client::Client;
     use starknet_gateway_types::reply::PendingBlock;
     use tokio::sync::{mpsc, watch};
@@ -171,7 +158,7 @@ mod tests {
     use crate::context::{RpcConfig, RpcContext};
     use crate::jsonrpc::{handle_json_rpc_socket, RpcResponse};
     use crate::pending::PendingWatcher;
-    use crate::v02::types::syncing::Syncing;
+    use crate::types::syncing::Syncing;
     use crate::{v08, Notifications, PendingData, SyncState};
 
     #[tokio::test]
@@ -197,7 +184,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -286,7 +273,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -339,7 +326,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -388,7 +375,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"]["subscription_id"].as_u64().unwrap()
+                json["result"].as_u64().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -496,13 +483,18 @@ mod tests {
             }
             .into(),
             chain_id: ChainId::MAINNET,
+            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
             sequencer: Client::mainnet(Duration::from_secs(10)),
             websocket: None,
             notifications,
+            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
+                .unwrap(),
             config: RpcConfig {
                 batch_concurrency_limit: 1.try_into().unwrap(),
                 get_events_max_blocks_to_scan: 1.try_into().unwrap(),
                 get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
+                #[cfg(feature = "aggregate_bloom")]
+                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
                 custom_versioned_constants: None,
             },
         };

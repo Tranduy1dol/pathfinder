@@ -22,7 +22,7 @@ use p2p_proto::state::{
 use p2p_proto::transaction::{TransactionWithReceipt, TransactionsRequest, TransactionsResponse};
 use pathfinder_common::event::Event;
 use pathfinder_common::state_update::{ContractClassUpdate, StateUpdateData};
-use pathfinder_common::transaction::TransactionVariant;
+use pathfinder_common::transaction::Transaction;
 use pathfinder_common::{
     BlockNumber,
     CasmHash,
@@ -37,7 +37,6 @@ use pathfinder_common::{
     TransactionIndex,
 };
 use tokio::sync::{mpsc, RwLock};
-use tokio_stream::wrappers::ReceiverStream;
 
 #[cfg(test)]
 mod fixtures;
@@ -298,7 +297,7 @@ impl BlockClient for Client {
         block: BlockNumber,
     ) -> Option<(
         PeerId,
-        impl Stream<Item = anyhow::Result<(TransactionVariant, Receipt)>>,
+        impl Stream<Item = anyhow::Result<(Transaction, Receipt)>>,
     )> {
         let request = TransactionsRequest {
             iteration: Iteration {
@@ -330,7 +329,7 @@ impl BlockClient for Client {
                     match x {
                         Ok(TransactionsResponse::Fin) => unreachable!("Already handled Fin above"),
                         Ok(TransactionsResponse::TransactionWithReceipt(tx_with_receipt)) => Ok((
-                            TransactionVariant::try_from_dto(tx_with_receipt.transaction)?,
+                            Transaction::try_from_dto(tx_with_receipt.transaction)?,
                             Receipt::try_from((
                                 tx_with_receipt.receipt,
                                 TransactionIndex::new(i.try_into().unwrap())
@@ -514,23 +513,27 @@ impl BlockClient for Client {
                     Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo0 {
                         class,
                         domain: _,
+                        class_hash,
                     })) => {
                         let definition = CairoDefinition::try_from_dto(class)
                             .map_err(|_| ClassDefinitionsError::CairoDefinitionError(peer))?;
                         class_definitions.push(ClassDefinition::Cairo {
                             block_number: block,
                             definition: definition.0,
+                            hash: ClassHash(class_hash.0),
                         });
                     }
                     Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo1 {
                         class,
                         domain: _,
+                        class_hash,
                     })) => {
                         let definition = SierraDefinition::try_from_dto(class)
                             .map_err(|_| ClassDefinitionsError::SierraDefinitionError(peer))?;
                         class_definitions.push(ClassDefinition::Sierra {
                             block_number: block,
                             sierra_definition: definition.0,
+                            hash: SierraHash(class_hash.0),
                         });
                     }
                     Ok(ClassesResponse::Fin) => {
@@ -641,8 +644,7 @@ mod header_stream {
 
         tracing::trace!(?start, ?stop, ?dir, "Streaming headers");
 
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
+        make_stream::from_future(move |tx| async move {
             // Loop which refreshes peer set once we exhaust it.
             loop {
                 'next_peer: for peer in get_peers().await {
@@ -672,9 +674,7 @@ mod header_stream {
                     // with i.e. don't let them drip feed us etc.
                 }
             }
-        });
-
-        ReceiverStream::new(rx)
+        })
     }
 
     async fn handle_response(
@@ -689,11 +689,14 @@ mod header_stream {
             Ok(BlockHeadersResponse::Header(hdr)) => match SignedBlockHeader::try_from_dto(*hdr) {
                 Ok(hdr) => {
                     if done(direction, *start, stop) {
-                        tracing::debug!(%peer, "Header stream Fin missing, got extra header instead");
+                        tracing::debug!(%peer, "Header stream Fin missing, got extra header instead, terminating");
                         return Action::TerminateStream;
                     }
 
-                    _ = tx.send(PeerData::new(peer, hdr)).await;
+                    if tx.send(PeerData::new(peer, hdr)).await.is_err() {
+                        tracing::debug!(%peer, "Failed to yield to stream, terminating");
+                        return Action::TerminateStream;
+                    }
 
                     *start = match direction {
                         Direction::Forward => *start + 1,
@@ -703,7 +706,7 @@ mod header_stream {
                     Action::NextResponse
                 }
                 Err(error) => {
-                    tracing::debug!(%peer, %error, "Header stream failed");
+                    tracing::debug!(%peer, %error, "Header stream failed, terminating");
                     if done(direction, *start, stop) {
                         return Action::TerminateStream;
                     }
@@ -720,7 +723,7 @@ mod header_stream {
                 Action::NextPeer
             }
             Err(error) => {
-                tracing::debug!(%peer, %error, "Header stream failed");
+                tracing::debug!(%peer, %error, "Header stream failed, terminating");
                 if done(direction, *start, stop) {
                     return Action::TerminateStream;
                 }
@@ -775,11 +778,10 @@ mod transaction_stream {
     {
         tracing::trace!(?start, ?stop, "Streaming Transactions");
 
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
-            let mut counts_and_commitments_stream = Box::pin(counts_stream);
+        make_stream::from_future(move |tx| async move {
+            let mut expected_transaction_counts_stream = Box::pin(counts_stream);
 
-            let cnt = match try_next(&mut counts_and_commitments_stream).await {
+            let cnt = match try_next(&mut expected_transaction_counts_stream).await {
                 Ok(x) => x,
                 Err(e) => {
                     _ = tx.send(Err(e)).await;
@@ -824,7 +826,7 @@ mod transaction_stream {
                         if yield_block(
                             peer,
                             &mut progress,
-                            &mut counts_and_commitments_stream,
+                            &mut expected_transaction_counts_stream,
                             transactions,
                             &mut start,
                             stop,
@@ -839,9 +841,7 @@ mod transaction_stream {
                     return;
                 }
             }
-        });
-
-        ReceiverStream::new(rx)
+        })
     }
 
     /// ### Important
@@ -851,14 +851,14 @@ mod transaction_stream {
         peer: PeerId,
         response: std::io::Result<TransactionsResponse>,
         txn_idx: TransactionIndex,
-    ) -> Option<(TransactionVariant, Receipt)> {
+    ) -> Option<(Transaction, Receipt)> {
         match response {
             Ok(TransactionsResponse::TransactionWithReceipt(TransactionWithReceipt {
                 transaction,
                 receipt,
             })) => {
                 if let (Ok(t), Ok(r)) = (
-                    TransactionVariant::try_from_dto(transaction),
+                    Transaction::try_from_dto(transaction),
                     Receipt::try_from((receipt, txn_idx)),
                 ) {
                     Some((t, r))
@@ -906,16 +906,21 @@ mod transaction_stream {
         peer: PeerId,
         progress: &mut BlockProgress,
         count_stream: &mut (impl Stream<Item = anyhow::Result<usize>> + Unpin + Send + 'static),
-        transactions: Vec<(TransactionVariant, Receipt)>,
+        transactions: Vec<(Transaction, Receipt)>,
         start: &mut BlockNumber,
         stop: BlockNumber,
         tx: mpsc::Sender<StreamItem<(TransactionData, BlockNumber)>>,
     ) -> bool {
         tracing::trace!(block_number=%start, "All transactions received for block");
 
-        _ = tx
+        if tx
             .send(Ok(PeerData::new(peer, (transactions, *start))))
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::debug!(%peer, "Failed to yield to stream, terminating");
+            return true;
+        }
 
         if *start == stop {
             return true;
@@ -956,8 +961,7 @@ mod state_diff_stream {
     {
         tracing::trace!(?start, ?stop, "Streaming state diffs");
 
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
+        make_stream::from_future(move |tx| async move {
             let mut length_stream = Box::pin(length_stream);
 
             let cnt = match try_next(&mut length_stream).await {
@@ -1018,9 +1022,7 @@ mod state_diff_stream {
                     return;
                 }
             }
-        });
-
-        ReceiverStream::new(rx)
+        })
     }
 
     /// ### Important
@@ -1135,7 +1137,14 @@ mod state_diff_stream {
     ) -> bool {
         tracing::trace!(block_number=%start, "State diff received for block");
 
-        _ = tx.send(Ok(PeerData::new(peer, (state_diff, *start)))).await;
+        if tx
+            .send(Ok(PeerData::new(peer, (state_diff, *start))))
+            .await
+            .is_err()
+        {
+            tracing::debug!(%peer, "Failed to yield to stream, terminating");
+            return true;
+        }
 
         if *start == stop {
             return true;
@@ -1176,8 +1185,7 @@ mod class_definition_stream {
     {
         tracing::trace!(?start, ?stop, "Streaming classes");
 
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
+        make_stream::from_future(move |tx| async move {
             let mut declared_class_counts_stream = Box::pin(counts_stream);
 
             let cnt = match try_next(&mut declared_class_counts_stream).await {
@@ -1240,9 +1248,7 @@ mod class_definition_stream {
                     return;
                 }
             }
-        });
-
-        ReceiverStream::new(rx)
+        })
     }
 
     fn make_request(start: BlockNumber, stop: BlockNumber) -> ClassesRequest {
@@ -1270,7 +1276,11 @@ mod class_definition_stream {
         block_number: BlockNumber,
     ) -> Option<ClassDefinition> {
         match response {
-            Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo0 { class, domain: _ })) => {
+            Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo0 {
+                class,
+                domain: _,
+                class_hash,
+            })) => {
                 let Ok(CairoDefinition(definition)) = CairoDefinition::try_from_dto(class) else {
                     // TODO punish the peer
                     tracing::debug!(%peer, "Cairo definition failed to parse");
@@ -1280,9 +1290,14 @@ mod class_definition_stream {
                 Some(ClassDefinition::Cairo {
                     block_number,
                     definition,
+                    hash: ClassHash(class_hash.0),
                 })
             }
-            Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo1 { class, domain: _ })) => {
+            Ok(ClassesResponse::Class(p2p_proto::class::Class::Cairo1 {
+                class,
+                domain: _,
+                class_hash,
+            })) => {
                 let Ok(SierraDefinition(definition)) = SierraDefinition::try_from_dto(class) else {
                     // TODO punish the peer
                     tracing::debug!(%peer, "Sierra definition failed to parse");
@@ -1292,6 +1307,7 @@ mod class_definition_stream {
                 Some(ClassDefinition::Sierra {
                     block_number,
                     sierra_definition: definition,
+                    hash: SierraHash(class_hash.0),
                 })
             }
             Ok(ClassesResponse::Fin) => {
@@ -1320,7 +1336,14 @@ mod class_definition_stream {
         tracing::trace!(block_number=%start, "All classes received for block");
 
         for class_definition in class_definitions {
-            _ = tx.send(Ok(PeerData::new(peer, class_definition))).await;
+            if tx
+                .send(Ok(PeerData::new(peer, class_definition)))
+                .await
+                .is_err()
+            {
+                tracing::debug!(%peer, "Failed to yield to stream, terminating");
+                return true;
+            }
         }
 
         if *start == stop {
@@ -1361,8 +1384,7 @@ mod event_stream {
     {
         tracing::trace!(?start, ?stop, "Streaming events");
 
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(async move {
+        make_stream::from_future(move |tx| async move {
             let mut counts_stream = Box::pin(counts_stream);
 
             let Some(Ok(cnt)) = counts_stream.next().await else {
@@ -1427,9 +1449,7 @@ mod event_stream {
                     return;
                 }
             }
-        });
-
-        ReceiverStream::new(rx)
+        })
     }
 
     fn make_request(start: BlockNumber, stop: BlockNumber) -> EventsRequest {
@@ -1505,7 +1525,14 @@ mod event_stream {
     ) -> bool {
         tracing::trace!(block_number=%start, "All events received for block");
 
-        _ = tx.send(Ok(PeerData::new(peer, (*start, events)))).await;
+        if tx
+            .send(Ok(PeerData::new(peer, (*start, events))))
+            .await
+            .is_err()
+        {
+            tracing::debug!(%peer, "Failed to yield to stream, terminating");
+            return true;
+        }
 
         if *start == stop {
             return true;
@@ -1530,14 +1557,15 @@ mod event_stream {
 
 async fn try_next<T>(
     count_stream: &mut (impl Stream<Item = anyhow::Result<T>> + Unpin + Send + 'static),
-) -> Result<T, PeerData<anyhow::Error>> {
+) -> Result<T, anyhow::Error> {
     match count_stream.next().await {
         Some(Ok(cnt)) => Ok(cnt),
-        Some(Err(e)) => Err(PeerData::new(PeerId::random(), e)),
-        None => Err(PeerData::new(
-            PeerId::random(),
-            anyhow::anyhow!("Count stream terminated prematurely"),
-        )),
+        // This is a non-recoverable error, because "Counter" streams fail only if the underlying
+        // database fails.
+        Some(Err(e)) => Err(e),
+        // This is a non-recoverable error, because we expect all the necessary headers that are the
+        // source of the stream to be in the database.
+        None => Err(anyhow::anyhow!("Count stream terminated prematurely")),
     }
 }
 

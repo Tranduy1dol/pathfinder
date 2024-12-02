@@ -1,5 +1,8 @@
 use std::num::NonZeroUsize;
 
+#[cfg(feature = "aggregate_bloom")]
+use anyhow::Context;
+use anyhow::Result;
 use pathfinder_common::event::Event;
 use pathfinder_common::{
     BlockHash,
@@ -10,6 +13,8 @@ use pathfinder_common::{
     TransactionHash,
 };
 
+#[cfg(feature = "aggregate_bloom")]
+use crate::bloom::AggregateBloom;
 use crate::bloom::BloomFilter;
 use crate::prelude::*;
 use crate::ReorgCounter;
@@ -63,14 +68,76 @@ pub struct PageOfEvents {
 }
 
 impl Transaction<'_> {
-    pub(super) fn upsert_block_events<'a>(
+    #[cfg(feature = "aggregate_bloom")]
+    pub fn reconstruct_running_aggregate(&self) -> anyhow::Result<()> {
+        let aggregate = reconstruct_running_aggregate(self.inner())?;
+        let mut running_aggregate = match self.running_aggregate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("Poisoned lock in reconstruct_running_aggregate");
+                poisoned.into_inner()
+            }
+        };
+
+        *running_aggregate = aggregate;
+
+        Ok(())
+    }
+
+    /// Upsert the [aggregate event bloom filter](AggregateBloom) for the given
+    /// block number. This function operates under the assumption that
+    /// blocks are _never_ skipped so even if there are no events for a
+    /// block, this function should still be called with an empty iterator.
+    /// When testing it is fine to skip blocks, as long as the block at the end
+    /// of the current range is not skipped.
+    #[cfg(feature = "aggregate_bloom")]
+    pub(super) fn upsert_block_events_aggregate<'a>(
         &self,
         block_number: BlockNumber,
         events: impl Iterator<Item = &'a Event>,
     ) -> anyhow::Result<()> {
         let mut stmt = self.inner().prepare_cached(
-            "INSERT INTO starknet_events_filters (block_number, bloom) VALUES (?, ?) ON CONFLICT \
-             DO UPDATE SET bloom=excluded.bloom",
+            r"
+            INSERT INTO starknet_events_filters_aggregate
+            (from_block, to_block, bitmap)
+            VALUES (?, ?, ?)
+            ON CONFLICT DO UPDATE SET bitmap=excluded.bitmap
+            ",
+        )?;
+
+        let mut running_aggregate = self.running_aggregate.lock().unwrap();
+
+        let mut bloom = BloomFilter::new();
+        for event in events {
+            bloom.set_keys(&event.keys);
+            bloom.set_address(&event.from_address);
+        }
+
+        running_aggregate.add_bloom(&bloom, block_number);
+        // This check is the reason that blocks cannot be skipped, if they were we would
+        // risk missing the last block of the current aggregate's range.
+        if block_number == running_aggregate.to_block {
+            stmt.execute(params![
+                &running_aggregate.from_block,
+                &running_aggregate.to_block,
+                &running_aggregate.compress_bitmap()
+            ])?;
+
+            *running_aggregate = AggregateBloom::new(running_aggregate.to_block + 1);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn upsert_block_events<'a>(
+        &self,
+        block_number: BlockNumber,
+        events: impl Iterator<Item = &'a Event>,
+    ) -> anyhow::Result<()> {
+        #[rustfmt::skip]
+        let mut stmt = self.inner().prepare_cached(
+            "INSERT INTO starknet_events_filters (block_number, bloom) VALUES (?, ?) \
+            ON CONFLICT DO UPDATE SET bloom=excluded.bloom",
         )?;
 
         let mut bloom = BloomFilter::new();
@@ -231,8 +298,8 @@ impl Transaction<'_> {
                 }
             }
 
-            // Stop if we have a page of events plus an extra one to decide if we're on the
-            // last page.
+            // Stop if we have a page of events plus an extra one to decide if we're on
+            // the last page.
             if emitted_events.len() > filter.page_size {
                 break ScanResult::PageFull;
             }
@@ -285,6 +352,160 @@ impl Transaction<'_> {
                     }),
                 });
             }
+        }
+    }
+
+    #[cfg(feature = "aggregate_bloom")]
+    pub fn events_from_aggregate(
+        &self,
+        filter: &EventFilter,
+        max_blocks_to_scan: NonZeroUsize,
+        max_bloom_filters_to_load: NonZeroUsize,
+    ) -> Result<PageOfEvents, EventFilterError> {
+        if filter.page_size < 1 {
+            return Err(EventFilterError::PageSizeTooSmall);
+        }
+
+        let from_block = filter.from_block.unwrap_or(BlockNumber::GENESIS);
+        let to_block = filter.to_block.unwrap_or(BlockNumber::MAX);
+
+        let (aggregates, load_limit_reached) = self.load_limited_aggregate_bloom_range(
+            from_block,
+            to_block,
+            max_bloom_filters_to_load,
+        )?;
+
+        let blocks_to_scan = aggregates
+            .iter()
+            .flat_map(|aggregate| aggregate.blocks_for_filter(filter))
+            .filter(|&block| (from_block..=to_block).contains(&block));
+
+        let keys: Vec<std::collections::HashSet<_>> = filter
+            .keys
+            .iter()
+            .map(|keys| keys.iter().collect())
+            .collect();
+
+        let key_filter_is_empty = filter.keys.iter().flatten().count() == 0;
+        let mut offset = filter.offset;
+
+        let mut emitted_events = vec![];
+
+        for (blocks_scanned, block) in blocks_to_scan.enumerate() {
+            if blocks_scanned >= max_blocks_to_scan.get() {
+                tracing::trace!("Reached block scan limit");
+                return Ok(PageOfEvents {
+                    events: emitted_events,
+                    continuation_token: Some(ContinuationToken {
+                        block_number: block,
+                        offset: 0,
+                    }),
+                });
+            }
+
+            let events_required = filter.page_size + 1 - emitted_events.len();
+            tracing::trace!(%block, %events_required, "Processing block");
+
+            let Some(block_header) = self.block_header(crate::BlockId::Number(block))? else {
+                break;
+            };
+
+            let events = match self.events_for_block(block.into())? {
+                Some(events) => events,
+                // Reached the end of P2P synced events.
+                None => {
+                    return Ok(PageOfEvents {
+                        events: emitted_events,
+                        continuation_token: None,
+                    })
+                }
+            };
+
+            let events = events
+                .into_iter()
+                .flat_map(|(transaction_hash, events)| {
+                    events.into_iter().zip(std::iter::repeat(transaction_hash))
+                })
+                .filter(|(event, _)| match filter.contract_address {
+                    Some(address) => event.from_address == address,
+                    None => true,
+                })
+                .filter(|(event, _)| {
+                    if key_filter_is_empty {
+                        return true;
+                    }
+
+                    if event.keys.len() < keys.len() {
+                        return false;
+                    }
+
+                    event
+                        .keys
+                        .iter()
+                        .zip(keys.iter())
+                        .all(|(key, filter)| filter.is_empty() || filter.contains(key))
+                })
+                .skip_while(|_| {
+                    let should_skip = offset > 0;
+                    offset = offset.saturating_sub(1);
+                    should_skip
+                })
+                .take(events_required)
+                .map(|(event, tx_hash)| EmittedEvent {
+                    data: event.data.clone(),
+                    keys: event.keys.clone(),
+                    from_address: event.from_address,
+                    block_hash: block_header.hash,
+                    block_number: block_header.number,
+                    transaction_hash: tx_hash,
+                });
+
+            emitted_events.extend(events);
+
+            // Stop if we have a page of events plus an extra one to decide if we're on
+            // the last page.
+            if emitted_events.len() > filter.page_size {
+                let continuation_token = continuation_token(
+                    &emitted_events,
+                    ContinuationToken {
+                        block_number: from_block,
+                        offset: filter.offset,
+                    },
+                )
+                .unwrap();
+
+                emitted_events.truncate(filter.page_size);
+
+                return Ok(PageOfEvents {
+                    events: emitted_events,
+                    continuation_token: Some(ContinuationToken {
+                        block_number: continuation_token.block_number,
+                        // Account for the extra event.
+                        offset: continuation_token.offset - 1,
+                    }),
+                });
+            }
+        }
+
+        if load_limit_reached {
+            let last_loaded_block = aggregates
+                .last()
+                .expect("At least one filter is present")
+                .to_block;
+
+            Ok(PageOfEvents {
+                events: emitted_events,
+                continuation_token: Some(ContinuationToken {
+                    // Bloom filter range is inclusive so + 1.
+                    block_number: last_loaded_block + 1,
+                    offset: 0,
+                }),
+            })
+        } else {
+            Ok(PageOfEvents {
+                events: emitted_events,
+                continuation_token: None,
+            })
         }
     }
 
@@ -389,6 +610,225 @@ impl Transaction<'_> {
             None => Filter::Missing,
         })
     }
+
+    // TODO:
+    // Use this for `SubscribeEvents`
+    #[cfg(feature = "aggregate_bloom")]
+    #[allow(dead_code)]
+    fn load_aggregate_bloom_range(
+        &self,
+        start_block: BlockNumber,
+        end_block: BlockNumber,
+    ) -> anyhow::Result<Vec<AggregateBloom>> {
+        let mut stmt = self.inner().prepare_cached(
+            r"
+            SELECT from_block, to_block, bitmap
+            FROM starknet_events_filters_aggregate
+            WHERE from_block <= :end_block AND to_block >= :start_block
+            ORDER BY from_block
+            ",
+        )?;
+
+        let mut aggregates = stmt
+            .query_map(
+                named_params![
+                    ":end_block": &end_block,
+                    ":start_block": &start_block,
+                ],
+                |row| {
+                    let from_block = row.get_block_number(0)?;
+                    let to_block = row.get_block_number(1)?;
+                    let compressed_bitmap: Vec<u8> = row.get(2)?;
+
+                    Ok(AggregateBloom::from_existing_compressed(
+                        from_block,
+                        to_block,
+                        compressed_bitmap,
+                    ))
+                },
+            )
+            .context("Querying bloom filter range")?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // There are no aggregates in the database yet or the loaded aggregates
+        // don't cover the requested range.
+        let should_include_running = aggregates.last().map_or(true, |a| end_block > a.to_block);
+
+        if should_include_running {
+            let running_aggregate = match self.running_aggregate.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("Poisoned lock in load_aggregate_bloom_range");
+                    poisoned.into_inner()
+                }
+            };
+            aggregates.push(running_aggregate.clone());
+        }
+
+        Ok(aggregates)
+    }
+
+    #[cfg(feature = "aggregate_bloom")]
+    fn load_limited_aggregate_bloom_range(
+        &self,
+        start_block: BlockNumber,
+        end_block: BlockNumber,
+        max_bloom_filters_to_load: NonZeroUsize,
+    ) -> anyhow::Result<(Vec<AggregateBloom>, bool)> {
+        let mut select_filters_stmt = self.inner().prepare_cached(
+            r"
+            SELECT from_block, to_block, bitmap
+            FROM starknet_events_filters_aggregate
+            WHERE from_block <= :end_block AND to_block >= :start_block
+            ORDER BY from_block
+            LIMIT :max_bloom_filters_to_load
+            ",
+        )?;
+        let mut total_filters_stmt = self.inner().prepare_cached(
+            r"
+            SELECT COUNT(*)
+            FROM starknet_events_filters_aggregate
+            WHERE from_block <= :end_block AND to_block >= :start_block
+            ",
+        )?;
+
+        let mut aggregates = select_filters_stmt
+            .query_map(
+                named_params![
+                    ":end_block": &end_block,
+                    ":start_block": &start_block,
+                    ":max_bloom_filters_to_load": &max_bloom_filters_to_load.get(),
+                ],
+                |row| {
+                    let from_block = row.get_block_number(0)?;
+                    let to_block = row.get_block_number(1)?;
+                    let compressed_bitmap: Vec<u8> = row.get(2)?;
+
+                    Ok(AggregateBloom::from_existing_compressed(
+                        from_block,
+                        to_block,
+                        compressed_bitmap,
+                    ))
+                },
+            )
+            .context("Querying bloom filter range")?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // There are no aggregates in the database yet or the loaded aggregates
+        // don't cover the requested range.
+        let should_include_running = aggregates.last().map_or(true, |a| end_block > a.to_block);
+
+        let total_aggregate_filters = total_filters_stmt.query_row(
+            named_params![
+                ":end_block": &end_block,
+                ":start_block": &start_block,
+            ],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let load_limit_reached = total_aggregate_filters > max_bloom_filters_to_load.get() as u64;
+
+        if should_include_running && !load_limit_reached {
+            let running_aggregate = match self.running_aggregate.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::error!("Poisoned lock in load_aggregate_bloom_range");
+                    poisoned.into_inner()
+                }
+            };
+            aggregates.push(running_aggregate.clone());
+        }
+
+        Ok((aggregates, load_limit_reached))
+    }
+}
+
+/// Reconstruct the [aggregate](crate::bloom::AggregateBloom) for the range of
+/// blocks between the last stored `to_block` in the aggregate Bloom filter
+/// table and the last overall block in the database. This is needed because the
+/// aggregate Bloom filter for each [block
+/// range](crate::bloom::AggregateBloom::BLOCK_RANGE_LEN) is stored once the
+/// range is complete, before that it is kept in memory and can be lost upon
+/// shutdown.
+#[cfg(feature = "aggregate_bloom")]
+pub fn reconstruct_running_aggregate(
+    tx: &rusqlite::Transaction<'_>,
+) -> anyhow::Result<AggregateBloom> {
+    use super::transaction;
+
+    let mut last_to_block_stmt = tx.prepare(
+        r"
+        SELECT to_block
+        FROM starknet_events_filters_aggregate
+        ORDER BY from_block DESC LIMIT 1
+        ",
+    )?;
+    let mut events_to_reconstruct_stmt = tx.prepare(
+        r"
+        SELECT events
+        FROM transactions
+        WHERE block_number >= :first_running_aggregate_block
+        ",
+    )?;
+
+    let last_to_block = last_to_block_stmt
+        .query_row([], |row| row.get::<_, u64>(0))
+        .optional()
+        .context("Querying last stored aggregate to_block")?;
+
+    let first_running_aggregate_block = match last_to_block {
+        Some(last_to_block) => BlockNumber::new_or_panic(last_to_block + 1),
+        // Aggregate Bloom filter table is empty -> reconstruct running aggregate
+        // from the genesis block.
+        None => BlockNumber::GENESIS,
+    };
+
+    let events_to_reconstruct: Vec<Option<Vec<Vec<Event>>>> = events_to_reconstruct_stmt
+        .query_and_then(
+            named_params![":first_running_aggregate_block": &first_running_aggregate_block],
+            |row| {
+                let events: Option<transaction::dto::EventsForBlock> = row
+                    .get_optional_blob(0)?
+                    .map(|events_blob| -> anyhow::Result<_> {
+                        let events = transaction::compression::decompress_events(events_blob)
+                            .context("Decompressing events")?;
+                        let events: transaction::dto::EventsForBlock =
+                            bincode::serde::decode_from_slice(&events, bincode::config::standard())
+                                .context("Deserializing events")?
+                                .0;
+
+                        Ok(events)
+                    })
+                    .transpose()?;
+
+                Ok(events.map(|events| {
+                    events
+                        .events()
+                        .into_iter()
+                        .map(|e| e.into_iter().map(Into::into).collect())
+                        .collect()
+                }))
+            },
+        )
+        .context("Querying events to reconstruct")?
+        .collect::<anyhow::Result<_>>()?;
+
+    let mut running_aggregate = AggregateBloom::new(first_running_aggregate_block);
+
+    for (block, events_for_block) in events_to_reconstruct.iter().enumerate() {
+        if let Some(events) = events_for_block {
+            let block_number = first_running_aggregate_block + block as u64;
+
+            let mut bloom = BloomFilter::new();
+            for event in events.iter().flatten() {
+                bloom.set_keys(&event.keys);
+                bloom.set_address(&event.from_address);
+            }
+
+            running_aggregate.add_bloom(&bloom, block_number);
+        }
+    }
+
+    Ok(running_aggregate)
 }
 
 fn continuation_token(
@@ -454,6 +894,9 @@ mod tests {
         LazyLock::new(|| NonZeroUsize::new(100).unwrap());
     static MAX_BLOOM_FILTERS_TO_LOAD: LazyLock<NonZeroUsize> =
         LazyLock::new(|| NonZeroUsize::new(100).unwrap());
+    #[cfg(feature = "aggregate_bloom")]
+    static MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD: LazyLock<NonZeroUsize> =
+        LazyLock::new(|| NonZeroUsize::new(3).unwrap());
 
     #[test_log::test(test)]
     fn get_events_with_fully_specified_filter() {
@@ -483,6 +926,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -623,6 +1078,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -654,6 +1121,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -687,6 +1166,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         // test continuation token
         let filter = EventFilter {
             from_block: Some(events.continuation_token.unwrap().block_number),
@@ -709,6 +1200,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -739,6 +1242,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -769,6 +1284,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -799,11 +1326,24 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         // try event keys in the wrong order, should not match
         let filter = EventFilter {
             keys: vec![vec![expected_event.keys[1]], vec![expected_event.keys[0]]],
             ..filter
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -814,6 +1354,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -842,6 +1394,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -859,6 +1423,7 @@ mod tests {
             page_size: 10,
             offset: 0,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -873,6 +1438,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         let filter = EventFilter {
             from_block: None,
             to_block: None,
@@ -881,6 +1458,7 @@ mod tests {
             page_size: 10,
             offset: 10,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -895,6 +1473,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         let filter = EventFilter {
             from_block: None,
             to_block: None,
@@ -903,6 +1493,7 @@ mod tests {
             page_size: 10,
             offset: 30,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -913,6 +1504,18 @@ mod tests {
                 continuation_token: None
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -931,6 +1534,7 @@ mod tests {
             // _after_ the last one
             offset: test_utils::NUM_BLOCKS * test_utils::EVENTS_PER_BLOCK,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -941,6 +1545,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -964,6 +1580,7 @@ mod tests {
             page_size: 2,
             offset: 0,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -978,6 +1595,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         // increase offset
         let filter: EventFilter = EventFilter {
             from_block: None,
@@ -987,6 +1616,7 @@ mod tests {
             page_size: 2,
             offset: 2,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1000,6 +1630,18 @@ mod tests {
                 }),
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
 
         // using the continuation token should be equivalent to the previous query
         let filter: EventFilter = EventFilter {
@@ -1010,6 +1652,7 @@ mod tests {
             page_size: 2,
             offset: 2,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1024,6 +1667,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         // increase offset by two
         let filter = EventFilter {
             from_block: None,
@@ -1033,6 +1688,7 @@ mod tests {
             page_size: 2,
             offset: 4,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1044,6 +1700,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         // using the continuation token should be equivalent to the previous query
         let filter = EventFilter {
             from_block: Some(BlockNumber::new_or_panic(3)),
@@ -1053,6 +1721,7 @@ mod tests {
             page_size: 2,
             offset: 1,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1063,6 +1732,18 @@ mod tests {
                 continuation_token: None,
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    *MAX_BLOCKS_TO_SCAN,
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
     }
 
     #[test]
@@ -1080,6 +1761,7 @@ mod tests {
             page_size: 20,
             offset: 0,
         };
+
         let events = tx
             .events(&filter, 1.try_into().unwrap(), *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1094,6 +1776,18 @@ mod tests {
             }
         );
 
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    1.try_into().unwrap(),
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+
         let filter = EventFilter {
             from_block: Some(BlockNumber::new_or_panic(1)),
             to_block: None,
@@ -1102,6 +1796,7 @@ mod tests {
             page_size: 20,
             offset: 0,
         };
+
         let events = tx
             .events(&filter, 1.try_into().unwrap(), *MAX_BLOOM_FILTERS_TO_LOAD)
             .unwrap();
@@ -1115,6 +1810,156 @@ mod tests {
                 }),
             }
         );
+
+        #[cfg(feature = "aggregate_bloom")]
+        {
+            let events_from_aggregate = tx
+                .events_from_aggregate(
+                    &filter,
+                    1.try_into().unwrap(),
+                    *MAX_AGGREGATE_BLOOM_FILTERS_TO_LOAD,
+                )
+                .unwrap();
+            assert_eq!(events_from_aggregate, events);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "aggregate_bloom")]
+    fn crossing_aggregate_filter_range_stores_and_updates_running() {
+        let blocks: Vec<usize> = [
+            // First aggregate filter start.
+            BlockNumber::GENESIS,
+            BlockNumber::GENESIS + 1,
+            BlockNumber::GENESIS + 2,
+            BlockNumber::GENESIS + 3,
+            // End.
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN - 1,
+            // Second aggregate filter start.
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 1,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 2,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 3,
+            // End.
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN - 1,
+            // Third aggregate filter start.
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN,
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN + 1,
+        ]
+        .iter()
+        .map(|&n| n.get() as usize)
+        .collect();
+
+        let (storage, _) = test_utils::setup_custom_test_storage(&blocks, 2);
+        let mut connection = storage.connection().unwrap();
+        let tx = connection.transaction().unwrap();
+
+        let inserted_aggregate_filter_count = tx
+            .inner()
+            .prepare("SELECT COUNT(*) FROM starknet_events_filters_aggregate")
+            .unwrap()
+            .query_row([], |row| row.get::<_, u64>(0))
+            .unwrap();
+        assert_eq!(inserted_aggregate_filter_count, 2);
+
+        let running_aggregate = tx.running_aggregate.lock().unwrap();
+        // Running aggregate starts from next block range.
+        assert_eq!(
+            running_aggregate.from_block,
+            2 * AggregateBloom::BLOCK_RANGE_LEN
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aggregate_bloom")]
+    fn aggregate_bloom_filter_load_limit() {
+        let blocks: Vec<usize> = [
+            // First aggregate filter start.
+            BlockNumber::GENESIS,
+            BlockNumber::GENESIS + 1,
+            BlockNumber::GENESIS + 2,
+            BlockNumber::GENESIS + 3,
+            // End.
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN - 1,
+            // Second aggregate filter start.
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 1,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 2,
+            BlockNumber::GENESIS + AggregateBloom::BLOCK_RANGE_LEN + 3,
+            // End.
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN - 1,
+            // Third aggregate filter start.
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN,
+            BlockNumber::GENESIS + 2 * AggregateBloom::BLOCK_RANGE_LEN + 1,
+        ]
+        .iter()
+        .map(|&n| n.get() as usize)
+        .collect();
+
+        let (storage, test_data) = test_utils::setup_custom_test_storage(&blocks, 2);
+        let emitted_events = test_data.events;
+        let mut connection = storage.connection().unwrap();
+        let tx = connection.transaction().unwrap();
+
+        let filter = EventFilter {
+            from_block: None,
+            to_block: None,
+            contract_address: None,
+            // We're using a key which is present in _all_ events as the 2nd key...
+            keys: vec![vec![], vec![event_key!("0xdeadbeef")]],
+            page_size: emitted_events.len(),
+            offset: 0,
+        };
+
+        let events = tx
+            .events_from_aggregate(&filter, *MAX_BLOCKS_TO_SCAN, 1.try_into().unwrap())
+            .unwrap();
+
+        let first_aggregate_filter_range =
+            BlockNumber::GENESIS.get()..AggregateBloom::BLOCK_RANGE_LEN;
+        for event in events.events {
+            // ...but only events from the first bloom filter range are returned.
+            assert!(
+                first_aggregate_filter_range.contains(&event.block_number.get()),
+                "Event block number: {} should have been in the range: {:?}",
+                event.block_number.get(),
+                first_aggregate_filter_range
+            );
+        }
+        let continue_from_block = events.continuation_token.unwrap().block_number;
+        assert_eq!(continue_from_block, first_aggregate_filter_range.end);
+
+        let filter_with_offset = EventFilter {
+            from_block: Some(events.continuation_token.unwrap().block_number),
+            to_block: None,
+            contract_address: None,
+            // We're using a key which is present in _all_ events as the 2nd key...
+            keys: vec![vec![], vec![event_key!("0xdeadbeef")]],
+            page_size: emitted_events.len(),
+            offset: 0,
+        };
+
+        let events = tx
+            .events_from_aggregate(
+                &filter_with_offset,
+                *MAX_BLOCKS_TO_SCAN,
+                1.try_into().unwrap(),
+            )
+            .unwrap();
+        assert!(events.continuation_token.is_none());
+
+        let second_aggregate_filter_range =
+            AggregateBloom::BLOCK_RANGE_LEN..(2 * AggregateBloom::BLOCK_RANGE_LEN);
+        let third_aggregate_filter_range =
+            2 * AggregateBloom::BLOCK_RANGE_LEN..(3 * AggregateBloom::BLOCK_RANGE_LEN);
+        for event in events.events {
+            // ...but only events from the second (loaded) and third (running) bloom filter
+            // range are returned.
+            assert!(
+                (second_aggregate_filter_range.start..third_aggregate_filter_range.end)
+                    .contains(&event.block_number.get())
+            );
+        }
     }
 
     #[test]
@@ -1132,6 +1977,7 @@ mod tests {
             page_size: emitted_events.len(),
             offset: 0,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, 1.try_into().unwrap())
             .unwrap();
@@ -1154,6 +2000,7 @@ mod tests {
             page_size: emitted_events.len(),
             offset: 0,
         };
+
         let events = tx
             .events(&filter, *MAX_BLOCKS_TO_SCAN, 1.try_into().unwrap())
             .unwrap();
