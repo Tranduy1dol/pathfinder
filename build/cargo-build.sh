@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash
 if [[ "${TARGETARCH}" == "amd64" ]]; then
     CARGO_INCREMENTAL=0 cargo build --target x86_64-unknown-linux-gnu
 elif [[ "${TARGETARCH}" == "arm64" ]]; then
