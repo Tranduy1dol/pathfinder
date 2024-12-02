@@ -73,6 +73,8 @@ pub struct Block {
 pub struct PendingBlock {
     pub l1_gas_price: GasPrices,
     pub l1_data_gas_price: GasPrices,
+    #[serde(default)] // TODO: Needed until the gateway provides the l2 gas price
+    pub l2_gas_price: GasPrices,
 
     #[serde(rename = "parent_block_hash")]
     pub parent_hash: BlockHash,
@@ -185,19 +187,20 @@ pub mod call {
     }
 }
 
-/// Used to deserialize replies to Starknet transaction requests.
+/// Used to deserialize replies to Starknet transaction status requests.
 ///
-/// We only care about the statuses so we ignore other fields.
 /// Please note that this does not have to be backwards compatible:
 /// since we only ever use it to deserialize replies from the Starknet
 /// feeder gateway.
-#[serde_as]
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct TransactionStatus {
-    pub status: Status,
+    pub tx_status: Status,
     pub finality_status: transaction_status::FinalityStatus,
-    #[serde(default)]
-    pub execution_status: transaction_status::ExecutionStatus,
+    // For transactions that were not received, `"execution_status": null`
+    // in the gateway response.
+    pub execution_status: Option<transaction_status::ExecutionStatus>,
+    pub tx_failure_reason: Option<transaction_status::TxFailureReason>,
+    pub tx_revert_reason: Option<String>,
 }
 
 /// Types used when deserializing get_transaction replies.
@@ -223,6 +226,12 @@ pub mod transaction_status {
         Succeeded,
         Reverted,
         Rejected,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+    pub struct TxFailureReason {
+        pub code: String,
+        pub error_message: String,
     }
 }
 
@@ -318,6 +327,8 @@ pub mod transaction {
                 n_memory_holes: value.n_memory_holes,
                 data_availability: value.data_availability.unwrap_or_default().into(),
                 total_gas_consumed: value.total_gas_consumed.unwrap_or_default().into(),
+                // TODO: Fix this when we have a way to get L2 gas from the gateway
+                l2_gas: Default::default(),
             }
         }
     }
@@ -789,6 +800,14 @@ pub mod transaction {
         pub l1_gas: ResourceBound,
         #[serde(rename = "L2_GAS")]
         pub l2_gas: ResourceBound,
+        // Introduced in Starknet v0.13.4. This has to be optional because not sending it to the
+        // gateway is not equivalent to sending an explicit zero bound.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "L1_DATA_GAS"
+        )]
+        pub l1_data_gas: Option<ResourceBound>,
     }
 
     impl From<ResourceBounds> for pathfinder_common::transaction::ResourceBounds {
@@ -805,6 +824,8 @@ pub mod transaction {
             Self {
                 l1_gas: value.l1_gas.into(),
                 l2_gas: value.l2_gas.into(),
+                // TODO: add this when adding support for Starknet 0.13.4
+                l1_data_gas: None,
             }
         }
     }

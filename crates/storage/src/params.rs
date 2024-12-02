@@ -23,6 +23,7 @@ use pathfinder_common::{
     EventKey,
     Fee,
     GasPrice,
+    L1BlockNumber,
     L1DataAvailabilityMode,
     L1ToL2MessageNonce,
     L1ToL2MessagePayloadElem,
@@ -124,6 +125,7 @@ to_sql_felt!(
 to_sql_compressed_felt!(ContractNonce, StorageValue, TransactionNonce);
 
 to_sql_int!(BlockNumber, BlockTimestamp);
+to_sql_int!(L1BlockNumber);
 
 to_sql_builtin!(
     String,
@@ -131,6 +133,7 @@ to_sql_builtin!(
     Vec<u8>,
     &[u8],
     isize,
+    usize,
     i64,
     i32,
     i16,

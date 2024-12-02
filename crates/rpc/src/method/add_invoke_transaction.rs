@@ -4,7 +4,7 @@ use starknet_gateway_client::GatewayApi;
 use starknet_gateway_types::error::SequencerError;
 
 use crate::context::RpcContext;
-use crate::v02::types::request::BroadcastedInvokeTransaction;
+use crate::types::request::BroadcastedInvokeTransaction;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Transaction {
@@ -46,7 +46,7 @@ pub struct Output {
 #[derive(Debug)]
 pub enum AddInvokeTransactionError {
     InvalidTransactionNonce,
-    InsufficientMaxFee,
+    InsufficientResourcesForValidate,
     InsufficientAccountBalance,
     ValidationFailure(String),
     DuplicateTransaction,
@@ -59,7 +59,9 @@ impl From<AddInvokeTransactionError> for crate::error::ApplicationError {
     fn from(value: AddInvokeTransactionError) -> Self {
         match value {
             AddInvokeTransactionError::InvalidTransactionNonce => Self::InvalidTransactionNonce,
-            AddInvokeTransactionError::InsufficientMaxFee => Self::InsufficientMaxFee,
+            AddInvokeTransactionError::InsufficientResourcesForValidate => {
+                Self::InsufficientResourcesForValidate
+            }
             AddInvokeTransactionError::InsufficientAccountBalance => {
                 Self::InsufficientAccountBalance
             }
@@ -93,7 +95,7 @@ impl From<SequencerError> for AddInvokeTransactionError {
                 AddInvokeTransactionError::InsufficientAccountBalance
             }
             SequencerError::StarknetError(e) if e.code == InsufficientMaxFee.into() => {
-                AddInvokeTransactionError::InsufficientMaxFee
+                AddInvokeTransactionError::InsufficientResourcesForValidate
             }
             SequencerError::StarknetError(e) if e.code == InvalidTransactionNonce.into() => {
                 AddInvokeTransactionError::InvalidTransactionNonce
@@ -214,8 +216,8 @@ mod tests {
     use pathfinder_common::{ResourceAmount, ResourcePricePerUnit, Tip, TransactionVersion};
 
     use super::*;
-    use crate::v02::types::request::BroadcastedInvokeTransactionV1;
-    use crate::v02::types::{DataAvailabilityMode, ResourceBound, ResourceBounds};
+    use crate::types::request::BroadcastedInvokeTransactionV1;
+    use crate::types::{DataAvailabilityMode, ResourceBound, ResourceBounds};
 
     fn test_invoke_txn() -> Transaction {
         Transaction::Invoke(BroadcastedInvokeTransaction::V1(
@@ -252,6 +254,7 @@ mod tests {
         use serde_json::json;
 
         use super::*;
+        use crate::dto::serialize::{self, SerializeForVersion};
         use crate::dto::DeserializeForVersion;
 
         #[test]
@@ -340,7 +343,9 @@ mod tests {
             let error = AddInvokeTransactionError::from(starknet_error);
             let error = crate::error::ApplicationError::from(error);
             let error = crate::jsonrpc::RpcError::from(error);
-            let error = serde_json::to_value(error).unwrap();
+            let error = error
+                .serialize(serialize::Serializer::new(crate::RpcVersion::V07))
+                .unwrap();
 
             let expected = json!({
                 "code": 63,
@@ -355,7 +360,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "gateway 429"]
     async fn duplicate_transaction() {
-        use crate::v02::types::request::BroadcastedInvokeTransactionV1;
+        use crate::types::request::BroadcastedInvokeTransactionV1;
 
         let context = RpcContext::for_tests();
         let input = BroadcastedInvokeTransactionV1 {
@@ -396,7 +401,7 @@ mod tests {
     #[ignore = "gateway 429"]
     // https://external.integration.starknet.io/feeder_gateway/get_transaction?transactionHash=0x41906f1c314cca5f43170ea75d3b1904196a10101190d2b12a41cc61cfd17c
     async fn duplicate_v3_transaction() {
-        use crate::v02::types::request::BroadcastedInvokeTransactionV3;
+        use crate::types::request::BroadcastedInvokeTransactionV3;
 
         let context = RpcContext::for_tests_on(pathfinder_common::Chain::SepoliaIntegration);
         let input = BroadcastedInvokeTransactionV3 {
@@ -419,6 +424,7 @@ mod tests {
                     max_amount: ResourceAmount(0),
                     max_price_per_unit: ResourcePricePerUnit(0),
                 },
+                l1_data_gas: None,
             },
             tip: Tip(0),
             paymaster_data: vec![],

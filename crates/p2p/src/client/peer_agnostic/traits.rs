@@ -2,7 +2,7 @@ use futures::{Future, Stream};
 use libp2p::PeerId;
 use pathfinder_common::event::Event;
 use pathfinder_common::state_update::StateUpdateData;
-use pathfinder_common::transaction::TransactionVariant;
+use pathfinder_common::transaction::Transaction;
 use pathfinder_common::{BlockNumber, SignedBlockHeader, TransactionHash};
 
 use crate::client::types::{
@@ -16,7 +16,7 @@ use crate::client::types::{
 };
 use crate::PeerData;
 
-pub type StreamItem<T> = Result<PeerData<T>, PeerData<anyhow::Error>>;
+pub type StreamItem<T> = Result<PeerData<T>, anyhow::Error>;
 
 pub trait HeaderStream {
     fn header_stream(
@@ -82,7 +82,7 @@ pub trait BlockClient {
     ) -> impl Future<
         Output = Option<(
             PeerId,
-            impl Stream<Item = anyhow::Result<(TransactionVariant, Receipt)>> + Send,
+            impl Stream<Item = anyhow::Result<(Transaction, Receipt)>> + Send,
         )>,
     > + Send;
 

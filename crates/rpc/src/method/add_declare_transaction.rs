@@ -8,13 +8,13 @@ use starknet_gateway_types::request::add_transaction::{
 };
 
 use crate::context::RpcContext;
-use crate::v02::types::request::BroadcastedDeclareTransaction;
+use crate::types::request::BroadcastedDeclareTransaction;
 
 #[derive(Debug)]
 pub enum AddDeclareTransactionError {
     ClassAlreadyDeclared,
     InvalidTransactionNonce,
-    InsufficientMaxFee,
+    InsufficientResourcesForValidate,
     InsufficientAccountBalance,
     ValidationFailure(String),
     CompilationFailed,
@@ -32,7 +32,9 @@ impl From<AddDeclareTransactionError> for crate::error::ApplicationError {
         match value {
             AddDeclareTransactionError::ClassAlreadyDeclared => Self::ClassAlreadyDeclared,
             AddDeclareTransactionError::InvalidTransactionNonce => Self::InvalidTransactionNonce,
-            AddDeclareTransactionError::InsufficientMaxFee => Self::InsufficientMaxFee,
+            AddDeclareTransactionError::InsufficientResourcesForValidate => {
+                Self::InsufficientResourcesForValidate
+            }
             AddDeclareTransactionError::InsufficientAccountBalance => {
                 Self::InsufficientAccountBalance
             }
@@ -100,7 +102,7 @@ impl From<SequencerError> for AddDeclareTransactionError {
                 AddDeclareTransactionError::InsufficientAccountBalance
             }
             SequencerError::StarknetError(e) if e.code == InsufficientMaxFee.into() => {
-                AddDeclareTransactionError::InsufficientMaxFee
+                AddDeclareTransactionError::InsufficientResourcesForValidate
             }
             SequencerError::StarknetError(e) if e.code == InvalidTransactionNonce.into() => {
                 AddDeclareTransactionError::InvalidTransactionNonce
@@ -317,13 +319,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::v02::types::request::{
+    use crate::types::request::{
         BroadcastedDeclareTransaction,
         BroadcastedDeclareTransactionV1,
         BroadcastedDeclareTransactionV2,
         BroadcastedDeclareTransactionV3,
     };
-    use crate::v02::types::{
+    use crate::types::{
         CairoContractClass,
         ContractClass,
         DataAvailabilityMode,
@@ -379,8 +381,9 @@ mod tests {
             use serde_json::json;
 
             use super::super::*;
-            use crate::dto::DeserializeForVersion;
-            use crate::v02::types::request::BroadcastedDeclareTransactionV1;
+            use crate::dto::serialize::SerializeForVersion;
+            use crate::dto::{serialize, DeserializeForVersion};
+            use crate::types::request::BroadcastedDeclareTransactionV1;
             use crate::RpcVersion;
 
             fn test_declare_txn() -> Transaction {
@@ -458,7 +461,9 @@ mod tests {
                 let error = AddDeclareTransactionError::from(starknet_error);
                 let error = crate::error::ApplicationError::from(error);
                 let error = crate::jsonrpc::RpcError::from(error);
-                let error = serde_json::to_value(error).unwrap();
+                let error = error
+                    .serialize(serialize::Serializer::new(RpcVersion::V07))
+                    .unwrap();
 
                 let expected = json!({
                     "code": 63,
@@ -475,7 +480,7 @@ mod tests {
 
             use super::super::*;
             use crate::dto::DeserializeForVersion;
-            use crate::v02::types::request::BroadcastedDeclareTransactionV2;
+            use crate::types::request::BroadcastedDeclareTransactionV2;
             use crate::RpcVersion;
 
             fn test_declare_txn() -> Transaction {
@@ -738,6 +743,7 @@ mod tests {
                     max_amount: ResourceAmount(0),
                     max_price_per_unit: ResourcePricePerUnit(0),
                 },
+                l1_data_gas: None,
             },
             tip: Tip(0),
             paymaster_data: vec![],

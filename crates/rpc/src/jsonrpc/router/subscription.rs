@@ -10,10 +10,10 @@ use tracing::Instrument;
 
 use super::{run_concurrently, RpcRouter};
 use crate::context::RpcContext;
-use crate::dto::serialize::SerializeForVersion;
+use crate::dto::serialize::{self, SerializeForVersion};
 use crate::dto::DeserializeForVersion;
 use crate::error::ApplicationError;
-use crate::jsonrpc::{RequestId, RpcError, RpcRequest, RpcResponse};
+use crate::jsonrpc::{RpcError, RpcRequest, RpcResponse};
 use crate::{RpcVersion, SubscriptionId};
 
 pub const CATCH_UP_BATCH_SIZE: u64 = 64;
@@ -30,7 +30,6 @@ pub(super) struct InvokeParams {
     input: serde_json::Value,
     subscription_id: SubscriptionId,
     subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
-    req_id: RequestId,
     ws_tx: mpsc::Sender<Result<Message, RpcResponse>>,
     lock: Arc<RwLock<()>>,
 }
@@ -75,28 +74,30 @@ pub trait RpcSubscriptionFlow: Send + Sync {
     }
 
     /// The block to start streaming from. If the subscription endpoint does not
-    /// support catching up, this method should always return
-    /// [`BlockId::Latest`].
-    fn starting_block(params: &Self::Params) -> BlockId;
+    /// support catching up, leave this method unimplemented.
+    fn starting_block(_params: &Self::Params) -> BlockId {
+        BlockId::Latest
+    }
 
     /// Fetch historical data from the `from` block to the `to` block. The
     /// range is inclusive on both ends. If there is no historical data in the
     /// range, return an empty vec. If the subscription endpoint does not
-    /// support catching up, this method should always return
-    /// `Ok(CatchUp::default())`.
+    /// support catching up, leave this method unimplemented.
     async fn catch_up(
-        state: &RpcContext,
-        params: &Self::Params,
-        from: BlockNumber,
-        to: BlockNumber,
-    ) -> Result<CatchUp<Self::Notification>, RpcError>;
+        _state: &RpcContext,
+        _params: &Self::Params,
+        _from: BlockNumber,
+        _to: BlockNumber,
+    ) -> Result<CatchUp<Self::Notification>, RpcError> {
+        Ok(Default::default())
+    }
 
     /// Subscribe to active updates.
     async fn subscribe(
         state: RpcContext,
         params: Self::Params,
         tx: mpsc::Sender<SubscriptionMessage<Self::Notification>>,
-    );
+    ) -> Result<(), RpcError>;
 }
 
 pub struct CatchUp<T> {
@@ -143,7 +144,6 @@ where
             input,
             subscription_id,
             subscriptions,
-            req_id,
             ws_tx,
             lock,
         }: InvokeParams,
@@ -155,8 +155,8 @@ where
 
         let tx = SubscriptionSender {
             subscription_id,
-            subscriptions,
-            tx: ws_tx.clone(),
+            subscriptions: subscriptions.clone(),
+            tx: ws_tx,
             version: router.version,
             _phantom: Default::default(),
         };
@@ -165,9 +165,7 @@ where
 
         let mut current_block = match first_block {
             BlockId::Pending => {
-                return Err(RpcError::InvalidParams(
-                    "Pending block not supported".to_string(),
-                ));
+                return Err(RpcError::ApplicationError(ApplicationError::CallOnPending));
             }
             BlockId::Latest => {
                 // No need to catch up. The code below will subscribe to new blocks.
@@ -192,9 +190,13 @@ where
         };
 
         Ok(tokio::spawn(async move {
+            let _subscription_guard = SubscriptionsGuard {
+                subscription_id,
+                subscriptions,
+            };
             // This lock ensures that the streaming of subscriptions doesn't start before
             // the caller sends the success response for the subscription request.
-            let _guard = lock.read().await;
+            let _lock_guard = lock.read().await;
 
             // Catch up to the latest block in batches of BATCH_SIZE.
             if let Some(current_block) = current_block.as_mut() {
@@ -207,7 +209,7 @@ where
                         match T::catch_up(&router.context, &params, *current_block, end).await {
                             Ok(messages) => messages,
                             Err(e) => {
-                                tx.send_err(e, req_id.clone())
+                                tx.send_err(e)
                                     .await
                                     // Could error if the subscription is closing.
                                     .ok();
@@ -242,10 +244,16 @@ where
 
             // Subscribe to new blocks. Receive the first subscription message.
             let (tx1, mut rx1) = mpsc::channel::<SubscriptionMessage<T::Notification>>(1024);
-            {
+            tokio::spawn({
                 let params = params.clone();
-                tokio::spawn(T::subscribe(router.context.clone(), params, tx1));
-            }
+                let context = router.context.clone();
+                let tx = tx.clone();
+                async move {
+                    if let Err(e) = T::subscribe(context, params, tx1).await {
+                        tx.send_err(e).await.ok();
+                    }
+                }
+            });
             let first_msg = match rx1.recv().await {
                 Some(msg) => msg,
                 None => {
@@ -265,7 +273,7 @@ where
                         match T::catch_up(&router.context, &params, current_block, end).await {
                             Ok(messages) => messages,
                             Err(e) => {
-                                tx.send_err(e, req_id.clone())
+                                tx.send_err(e)
                                     .await
                                     // Could error if the subscription is closing.
                                     .ok();
@@ -319,6 +327,19 @@ where
     }
 }
 
+/// A guard to ensure that the subscription handle is removed when the
+/// subscription task corresponding to that handle returns.
+struct SubscriptionsGuard {
+    subscription_id: SubscriptionId,
+    subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for SubscriptionsGuard {
+    fn drop(&mut self) {
+        self.subscriptions.remove(&self.subscription_id);
+    }
+}
+
 type WsSender = mpsc::Sender<Result<Message, RpcResponse>>;
 type WsReceiver = mpsc::Receiver<Result<Message, axum::Error>>;
 
@@ -327,7 +348,7 @@ type WsReceiver = mpsc::Receiver<Result<Message, axum::Error>>;
 /// serves to allow easier testing. The sender sends `Result<_, RpcResponse>`
 /// purely for convenience, and the [`RpcResponse`] will be encoded into a
 /// [`Message::Text`].
-pub fn split_ws(ws: WebSocket) -> (WsSender, WsReceiver) {
+pub fn split_ws(ws: WebSocket, version: RpcVersion) -> (WsSender, WsReceiver) {
     let (mut ws_sender, mut ws_receiver) = ws.split();
     // Send messages to the websocket using an MPSC channel.
     let (sender_tx, mut sender_rx) = mpsc::channel::<Result<Message, RpcResponse>>(1024);
@@ -341,7 +362,12 @@ pub fn split_ws(ws: WebSocket) -> (WsSender, WsReceiver) {
                 }
                 Err(e) => {
                     if ws_sender
-                        .send(Message::Text(serde_json::to_string(&e).unwrap()))
+                        .send(Message::Text(
+                            serde_json::to_string(
+                                &e.serialize(serialize::Serializer::new(version)).unwrap(),
+                            )
+                            .unwrap(),
+                        ))
                         .await
                         .is_err()
                     {
@@ -379,7 +405,7 @@ pub fn handle_json_rpc_socket(
                     Ok(msg) => msg,
                     Err(e) => {
                         if ws_tx
-                            .send(Err(RpcResponse::parse_error(e.to_string())))
+                            .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
                             .is_err()
                         {
@@ -420,7 +446,7 @@ pub fn handle_json_rpc_socket(
                     Ok(raw_value) => raw_value,
                     Err(e) => {
                         if ws_tx
-                            .send(Err(RpcResponse::parse_error(e.to_string())))
+                            .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
                             .is_err()
                         {
@@ -441,7 +467,14 @@ pub fn handle_json_rpc_socket(
                 {
                     Ok(Some(response)) | Err(response) => {
                         if ws_tx
-                            .send(Ok(Message::Text(serde_json::to_string(&response).unwrap())))
+                            .send(Ok(Message::Text(
+                                serde_json::to_string(
+                                    &response
+                                        .serialize(serialize::Serializer::new(state.version))
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            )))
                             .await
                             .is_err()
                         {
@@ -460,7 +493,7 @@ pub fn handle_json_rpc_socket(
                     Ok(requests) => requests,
                     Err(e) => {
                         if ws_tx
-                            .send(Err(RpcResponse::parse_error(e.to_string())))
+                            .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
                             .is_err()
                         {
@@ -476,6 +509,7 @@ pub fn handle_json_rpc_socket(
                     if ws_tx
                         .send(Err(RpcResponse::invalid_request(
                             "A batch request must contain at least one request".to_owned(),
+                            state.version,
                         )))
                         .await
                         .is_err()
@@ -515,10 +549,17 @@ pub fn handle_json_rpc_socket(
                     continue;
                 }
 
+                let values = responses
+                    .into_iter()
+                    .map(|response| {
+                        response
+                            .serialize(serialize::Serializer::new(state.version))
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+
                 if ws_tx
-                    .send(Ok(Message::Text(
-                        serde_json::to_string(&responses).unwrap(),
-                    )))
+                    .send(Ok(Message::Text(serde_json::to_string(&values).unwrap())))
                     .await
                     .is_err()
                 {
@@ -541,7 +582,7 @@ async fn handle_request(
     lock: Arc<RwLock<()>>,
 ) -> Result<Option<RpcResponse>, RpcResponse> {
     let rpc_request = serde_json::from_str::<RpcRequest<'_>>(raw_request.get())
-        .map_err(|e| RpcResponse::invalid_request(e.to_string()))?;
+        .map_err(|e| RpcResponse::invalid_request(e.to_string(), state.version))?;
     let req_id = rpc_request.id;
 
     // Ignore notification requests.
@@ -564,43 +605,50 @@ async fn handle_request(
             RpcResponse::invalid_params(
                 req_id.clone(),
                 "Missing params for starknet_unsubscribe".to_string(),
+                state.version,
             )
         })?;
-        let params = serde_json::from_str::<StarknetUnsubscribeParams>(params.get())
-            .map_err(|e| RpcResponse::invalid_params(req_id.clone(), e.to_string()))?;
+        let params =
+            serde_json::from_str::<StarknetUnsubscribeParams>(params.get()).map_err(|e| {
+                RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version)
+            })?;
         let (_, handle) = subscriptions
             .remove(&params.subscription_id)
-            .ok_or_else(|| {
-                RpcResponse::invalid_params(req_id.clone(), "Subscription not found".to_string())
+            .ok_or_else(|| RpcResponse {
+                output: Err(RpcError::ApplicationError(
+                    ApplicationError::InvalidSubscriptionID,
+                )),
+                id: req_id.clone(),
+                version: state.version,
             })?;
         handle.abort();
         metrics::increment_counter!("rpc_method_calls_total", "method" => "starknet_unsubscribe", "version" => state.version.to_str());
         return Ok(Some(RpcResponse {
             output: Ok(true.into()),
             id: req_id,
+            version: state.version,
         }));
     }
 
     let (&method_name, endpoint) = state
         .subscription_endpoints
         .get_key_value(rpc_request.method.as_ref())
-        .ok_or_else(|| RpcResponse::method_not_found(req_id.clone()))?;
+        .ok_or_else(|| RpcResponse::method_not_found(req_id.clone(), state.version))?;
     metrics::increment_counter!("rpc_method_calls_total", "method" => method_name, "version" => state.version.to_str());
 
     let params = serde_json::to_value(rpc_request.params)
-        .map_err(|e| RpcResponse::invalid_params(req_id.clone(), e.to_string()))?;
+        .map_err(|e| RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version))?;
 
     // Start the subscription.
-    let state = state.clone();
+    let router = state.clone();
     let subscription_id = SubscriptionId::next();
     let ws_tx = ws_tx.clone();
     match endpoint
         .invoke(InvokeParams {
-            router: state,
+            router,
             input: params,
             subscription_id,
             subscriptions: subscriptions.clone(),
-            req_id: req_id.clone(),
             ws_tx: ws_tx.clone(),
             lock,
         })
@@ -611,15 +659,15 @@ async fn handle_request(
                 panic!("subscription id overflow");
             }
             Ok(Some(RpcResponse {
-                output: Ok(
-                    serde_json::to_value(&SubscriptionIdResult { subscription_id }).unwrap(),
-                ),
+                output: Ok(serde_json::to_value(subscription_id).unwrap()),
                 id: req_id,
+                version: state.version,
             }))
         }
         Err(e) => Err(RpcResponse {
             output: Err(e),
             id: req_id,
+            version: state.version,
         }),
     }
 }
@@ -627,11 +675,6 @@ async fn handle_request(
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StarknetUnsubscribeParams {
-    subscription_id: SubscriptionId,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct SubscriptionIdResult {
     subscription_id: SubscriptionId,
 }
 
@@ -683,16 +726,24 @@ impl<T: crate::dto::serialize::SerializeForVersion> SubscriptionSender<T> {
             .map_err(|_| mpsc::error::SendError(()))
     }
 
-    pub async fn send_err(
-        &self,
-        err: RpcError,
-        req_id: RequestId,
-    ) -> Result<(), mpsc::error::SendError<()>> {
+    pub async fn send_err(&self, err: RpcError) -> Result<(), mpsc::error::SendError<()>> {
+        if !self.subscriptions.contains_key(&self.subscription_id) {
+            // Race condition due to the subscription ending.
+            return Ok(());
+        }
+        let notification = RpcNotification {
+            jsonrpc: "2.0",
+            method: "pathfinder_subscriptionError",
+            params: SubscriptionResult {
+                subscription_id: self.subscription_id,
+                result: err,
+            },
+        }
+        .serialize(crate::dto::serialize::Serializer::new(self.version))
+        .unwrap();
+        let data = serde_json::to_string(&notification).unwrap();
         self.tx
-            .send(Err(RpcResponse {
-                output: Err(err),
-                id: req_id,
-            }))
+            .send(Ok(Message::Text(data)))
             .await
             .map_err(|_| mpsc::error::SendError(()))
     }
@@ -739,5 +790,250 @@ where
         serializer.serialize_field("subscription_id", &self.subscription_id)?;
         serializer.serialize_field("result", &self.result)?;
         serializer.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::async_trait;
+    use axum::extract::ws::Message;
+    use pathfinder_common::{BlockHash, BlockHeader, BlockId, BlockNumber, ChainId};
+    use pathfinder_crypto::Felt;
+    use pathfinder_ethereum::EthereumClient;
+    use pathfinder_storage::StorageBuilder;
+    use primitive_types::H160;
+    use starknet_gateway_client::Client;
+    use tokio::sync::mpsc;
+
+    use super::RpcSubscriptionEndpoint;
+    use crate::context::{RpcConfig, RpcContext};
+    use crate::dto::DeserializeForVersion;
+    use crate::jsonrpc::{
+        handle_json_rpc_socket,
+        CatchUp,
+        RpcRouter,
+        RpcSubscriptionFlow,
+        SubscriptionMessage,
+    };
+    use crate::pending::PendingWatcher;
+    use crate::types::syncing::Syncing;
+    use crate::{Notifications, SyncState};
+
+    #[tokio::test]
+    async fn test_error_returned_from_catch_up() {
+        struct ErrorFromCatchUp;
+
+        #[async_trait]
+        impl RpcSubscriptionFlow for ErrorFromCatchUp {
+            type Params = Params;
+            type Notification = serde_json::Value;
+
+            fn starting_block(_params: &Self::Params) -> BlockId {
+                BlockId::Number(BlockNumber::GENESIS)
+            }
+
+            async fn catch_up(
+                _state: &RpcContext,
+                _params: &Self::Params,
+                _from: BlockNumber,
+                _to: BlockNumber,
+            ) -> Result<CatchUp<Self::Notification>, crate::jsonrpc::RpcError> {
+                Err(crate::jsonrpc::RpcError::InternalError(anyhow::anyhow!(
+                    "error from catch_up"
+                )))
+            }
+
+            async fn subscribe(
+                _state: RpcContext,
+                _params: Self::Params,
+                _tx: tokio::sync::mpsc::Sender<SubscriptionMessage<Self::Notification>>,
+            ) -> Result<(), crate::jsonrpc::RpcError> {
+                Ok(())
+            }
+        }
+
+        let router = setup(5, ErrorFromCatchUp).await;
+        let (sender_tx, mut sender_rx) = mpsc::channel(1024);
+        let (receiver_tx, receiver_rx) = mpsc::channel(1024);
+        handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
+        receiver_tx
+            .send(Ok(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "test",
+                    "params": {}
+                })
+                .to_string(),
+            )))
+            .await
+            .unwrap();
+        let res = sender_rx.recv().await.unwrap().unwrap();
+        let subscription_id = match res {
+            Message::Text(json) => {
+                let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(json["jsonrpc"], "2.0");
+                assert_eq!(json["id"], 1);
+                json["result"].as_u64().unwrap()
+            }
+            _ => panic!("Expected text message"),
+        };
+        let msg = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match msg {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "pathfinder_subscriptionError",
+                "params": {
+                    "result": { "code": -32603, "message": "Internal error" },
+                    "subscription_id": subscription_id
+                }
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn test_error_returned_from_subscribe() {
+        struct ErrorFromSubscribe;
+
+        #[async_trait]
+        impl RpcSubscriptionFlow for ErrorFromSubscribe {
+            type Params = Params;
+            type Notification = serde_json::Value;
+
+            fn starting_block(_params: &Self::Params) -> BlockId {
+                BlockId::Number(BlockNumber::GENESIS)
+            }
+
+            async fn catch_up(
+                _state: &RpcContext,
+                _params: &Self::Params,
+                _from: BlockNumber,
+                _to: BlockNumber,
+            ) -> Result<CatchUp<Self::Notification>, crate::jsonrpc::RpcError> {
+                Ok(Default::default())
+            }
+
+            async fn subscribe(
+                _state: RpcContext,
+                _params: Self::Params,
+                _tx: tokio::sync::mpsc::Sender<SubscriptionMessage<Self::Notification>>,
+            ) -> Result<(), crate::jsonrpc::RpcError> {
+                Err(crate::jsonrpc::RpcError::InternalError(anyhow::anyhow!(
+                    "error from catch_up"
+                )))
+            }
+        }
+
+        let router = setup(5, ErrorFromSubscribe).await;
+        let (sender_tx, mut sender_rx) = mpsc::channel(1024);
+        let (receiver_tx, receiver_rx) = mpsc::channel(1024);
+        handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
+        receiver_tx
+            .send(Ok(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "test",
+                    "params": {}
+                })
+                .to_string(),
+            )))
+            .await
+            .unwrap();
+        let res = sender_rx.recv().await.unwrap().unwrap();
+        let subscription_id = match res {
+            Message::Text(json) => {
+                let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(json["jsonrpc"], "2.0");
+                assert_eq!(json["id"], 1);
+                json["result"].as_u64().unwrap()
+            }
+            _ => panic!("Expected text message"),
+        };
+        let msg = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match msg {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "pathfinder_subscriptionError",
+                "params": {
+                    "result": { "code": -32603, "message": "Internal error" },
+                    "subscription_id": subscription_id
+                }
+            })
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    struct Params;
+
+    impl DeserializeForVersion for Params {
+        fn deserialize(_: crate::dto::Value) -> Result<Self, serde_json::Error> {
+            Ok(Self)
+        }
+    }
+
+    async fn setup(num_blocks: u64, endpoint: impl RpcSubscriptionEndpoint + 'static) -> RpcRouter {
+        let storage = StorageBuilder::in_memory().unwrap();
+        tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || {
+                let mut conn = storage.connection().unwrap();
+                let db = conn.transaction().unwrap();
+                for i in 0..num_blocks {
+                    let header = BlockHeader {
+                        hash: BlockHash(Felt::from_u64(i)),
+                        number: BlockNumber::new_or_panic(i),
+                        parent_hash: BlockHash::ZERO,
+                        ..Default::default()
+                    };
+                    db.insert_block_header(&header).unwrap();
+                }
+                db.commit().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let (_, pending_data) = tokio::sync::watch::channel(Default::default());
+        let notifications = Notifications::default();
+        let ctx = RpcContext {
+            cache: Default::default(),
+            storage,
+            execution_storage: StorageBuilder::in_memory().unwrap(),
+            pending_data: PendingWatcher::new(pending_data),
+            sync_status: SyncState {
+                status: Syncing::False(false).into(),
+            }
+            .into(),
+            chain_id: ChainId::MAINNET,
+            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
+            sequencer: Client::mainnet(Duration::from_secs(10)),
+            websocket: None,
+            notifications,
+            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
+                .unwrap(),
+            config: RpcConfig {
+                batch_concurrency_limit: 1.try_into().unwrap(),
+                get_events_max_blocks_to_scan: 1.try_into().unwrap(),
+                get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
+                #[cfg(feature = "aggregate_bloom")]
+                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
+                custom_versioned_constants: None,
+            },
+        };
+        RpcRouter::builder(crate::RpcVersion::V08)
+            .register("test", endpoint)
+            .build(ctx)
     }
 }

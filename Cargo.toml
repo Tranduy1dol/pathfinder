@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/block-hashes",
     "crates/common",
     "crates/compiler",
     "crates/crypto",
@@ -9,6 +10,7 @@ members = [
     "crates/gateway-test-fixtures",
     "crates/gateway-test-utils",
     "crates/gateway-types",
+    "crates/make-stream",
     "crates/merkle-tree",
     "crates/p2p",
     "crates/p2p_proto",
@@ -38,7 +40,7 @@ lto = true
 opt-level = 3
 
 [workspace.package]
-version = "0.14.3"
+version = "0.15.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.80"
@@ -53,7 +55,7 @@ axum = "0.7.5"
 base64 = "0.13.1"
 bincode = "2.0.0-rc.3"
 bitvec = "1.0.1"
-blockifier = "=0.8.0-rc.3"
+blockifier = { git = "https://github.com/eqlabs/sequencer", branch = "eqlabs/main-v0.13.2" }
 bloomfilter = "1.0.12"
 bytes = "1.4.0"
 cached = "0.44.0"
@@ -121,7 +123,7 @@ serde_with = "3.7.0"
 sha2 = "0.10.7"
 sha3 = "0.10"
 # This one needs to match the version used by blockifier
-starknet_api = "=0.13.0-rc.1"
+starknet_api = { git = "https://github.com/eqlabs/sequencer", branch = "eqlabs/main-v0.13.2" }
 # This one needs to match the version used by blockifier
 starknet-types-core = "=0.1.5"
 syn = "1.0"
@@ -136,7 +138,7 @@ tokio-tungstenite = "0.21"
 tower = { version = "0.4.13", default-features = false }
 tower-http = { version = "0.5.2", default-features = false }
 tracing = "0.1.37"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["json"] }
 unsigned-varint = "0.8.0"
 url = "2.4.1"
 vergen = { version = "8", default-features = false }

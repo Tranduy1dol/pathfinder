@@ -1549,8 +1549,7 @@ dependencies = [
 [[package]]
 name = "blockifier"
 version = "0.8.0-rc.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fb99b6d20e12f5dff17a2b53e3e6cab54766357a638f90dafcb43c0ac933d4b"
+source = "git+https://github.com/eqlabs/sequencer?branch=eqlabs/main-v0.13.2#2e59ae0f7c0da559cd77bd9db794309a8e3fe99a"
 dependencies = [
  "anyhow",
  "ark-ec",
@@ -4705,7 +4704,7 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
 name = "gateway-test-utils"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -5217,7 +5216,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.7",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -6433,6 +6432,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "make-stream"
+version = "0.15.0"
+dependencies = [
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "match_cfg"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7027,7 +7034,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
 name = "p2p"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7040,6 +7047,7 @@ dependencies = [
  "hex",
  "ipnet",
  "libp2p",
+ "make-stream",
  "p2p_proto",
  "p2p_stream",
  "pathfinder-common",
@@ -7068,7 +7076,7 @@ dependencies = [
 
 [[package]]
 name = "p2p_proto"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "fake",
@@ -7089,7 +7097,7 @@ dependencies = [
 
 [[package]]
 name = "p2p_proto_derive"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7098,7 +7106,7 @@ dependencies = [
 
 [[package]]
 name = "p2p_stream"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7227,7 +7235,7 @@ checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
 
 [[package]]
 name = "pathfinder"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -7245,11 +7253,13 @@ dependencies = [
  "http 1.1.0",
  "ipnet",
  "jemallocator",
+ "make-stream",
  "metrics",
  "metrics-exporter-prometheus",
  "mockall",
  "p2p",
  "p2p_proto",
+ "pathfinder-block-hashes",
  "pathfinder-common",
  "pathfinder-compiler",
  "pathfinder-crypto",
@@ -7291,14 +7301,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathfinder-block-hashes"
+version = "0.15.0"
+dependencies = [
+ "pathfinder-common",
+ "pathfinder-crypto",
+]
+
+[[package]]
 name = "pathfinder-common"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "bitvec",
  "fake",
  "metrics",
  "num-bigint 0.4.6",
+ "num-traits 0.2.19",
  "paste",
  "pathfinder-crypto",
  "primitive-types",
@@ -7318,7 +7337,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-compiler"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "cairo-lang-starknet 1.0.0-alpha.6",
@@ -7339,7 +7358,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-crypto"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "ark-ff 0.4.2",
  "assert_matches",
@@ -7356,7 +7375,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-ethereum"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7376,7 +7395,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-executor"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "blockifier",
@@ -7396,7 +7415,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-merkle-tree"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -7412,7 +7431,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-retry"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "tokio",
  "tokio-retry",
@@ -7420,13 +7439,14 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-rpc"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_matches",
  "async-trait",
  "axum 0.7.5",
  "base64 0.13.1",
+ "bitvec",
  "bytes",
  "dashmap",
  "flate2",
@@ -7472,7 +7492,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-serde"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "num-bigint 0.4.6",
@@ -7487,7 +7507,7 @@ dependencies = [
 
 [[package]]
 name = "pathfinder-storage"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -9332,7 +9352,7 @@ dependencies = [
 
 [[package]]
 name = "starknet-gateway-client"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -9365,7 +9385,7 @@ dependencies = [
 
 [[package]]
 name = "starknet-gateway-test-fixtures"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "pathfinder-common",
  "pathfinder-crypto",
@@ -9373,7 +9393,7 @@ dependencies = [
 
 [[package]]
 name = "starknet-gateway-types"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -9412,8 +9432,7 @@ dependencies = [
 [[package]]
 name = "starknet_api"
 version = "0.13.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b505c9c076d9fce854304bd743c93ea540ebea6b16ec96819b07343a3aa2c7c"
+source = "git+https://github.com/eqlabs/sequencer?branch=eqlabs/main-v0.13.2#2e59ae0f7c0da559cd77bd9db794309a8e3fe99a"
 dependencies = [
  "bitvec",
  "cairo-lang-starknet-classes",
@@ -9613,7 +9632,7 @@ dependencies = [
 
 [[package]]
 name = "tagged"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "fake",
  "pretty_assertions_sorted",
@@ -9622,7 +9641,7 @@ dependencies = [
 
 [[package]]
 name = "tagged-debug-derive"
-version = "0.14.3"
+version = "0.15.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10127,6 +10146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6b213177105856957181934e4920de57730fc69bf42c37ee5bb664d406d9e1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10136,6 +10165,8 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
@@ -10143,6 +10174,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
