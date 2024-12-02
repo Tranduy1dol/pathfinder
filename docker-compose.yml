@@ -15,5 +15,4 @@ services:
       - .env
     ports:
       - "9545:9545"
-    command:
-      - "cargo run --bin pathfinder -- --network custom --chain-id ${CHAIN_ID} --feeder-gateway-url ${FEEDER_GATEWAY_URL} --gateway-url ${GATEWAY_URL} --storage.state-tries archive --data-directory ./pathfinder-db"
+    command: ['--network', 'custom', '--chain-id', '${CHAIN_ID}', '--feeder-gateway-url', '${FEEDER_GATEWAY_URL}', '--gateway-url', '${GATEWAY_URL}', '--storage.state-tries', 'archive', '--data-directory', './pathfinder-db']

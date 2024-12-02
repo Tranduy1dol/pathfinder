@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -e
 if [[ "${TARGETARCH}" == "amd64" ]]; then
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config libzstd-dev protobuf-compiler make
